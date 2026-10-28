@@ -1,0 +1,4 @@
+.env
+moodle_bot.db
+temp_downloads/
+__pycache__/
