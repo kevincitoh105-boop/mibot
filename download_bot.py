@@ -383,6 +383,20 @@ def login_moodle(usuario, contraseña, base_url=None):
             f"⚠️ Moodle respondió, pero no abrió una sesión (sin cookie de sesión). "
             f"{_SIN_VERIFICAR}",
             "sin cookie MoodleSession")
+    # upload.php exige un token de servicio web (la cookie de sesion no basta)
+    sesion.moodle_token = None
+    try:
+        r = sesion.post(f"{base_url}/login/token.php",
+                        data={'username': usuario, 'password': contraseña,
+                              'service': 'moodle_mobile_app'}, timeout=30)
+        datos = r.json()
+        if isinstance(datos, dict) and datos.get('token'):
+            sesion.moodle_token = datos['token']
+        else:
+            motivo = datos.get('errorcode') or datos.get('error') if isinstance(datos, dict) else datos
+            print(f"Moodle no entrego token de servicio: {motivo}")
+    except Exception as e:
+        print(f"No se pudo pedir el token de servicio: {type(e).__name__}: {e}")
     return sesion
 
 # --------------------------------------------------
@@ -447,9 +461,14 @@ class _CuerpoMultipart:
 
 def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
     url_subida = f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/upload.php"
+    token = getattr(sesion, 'moodle_token', None)
+    if not token:
+        return {"error": "Moodle no entregó un token de servicio (el servicio móvil "
+                         "'moodle_mobile_app' puede estar desactivado en este Moodle).",
+                "reintentable": False}
     cuerpo = _CuerpoMultipart(ruta_archivo, 'file_1', progreso)
     try:
-        respuesta = sesion.post(url_subida, data=cuerpo,
+        respuesta = sesion.post(url_subida, params={'token': token}, data=cuerpo,
                                 headers={'Content-Type': f'multipart/form-data; boundary={cuerpo.boundary}'},
                                 timeout=(30, 900))
         respuesta.raise_for_status()
