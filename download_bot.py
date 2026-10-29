@@ -476,6 +476,27 @@ def _mover_a_privados(sesion, base_url, token, draftid):
     except Exception as e:
         return f"No se pudo mover a Archivos privados: {type(e).__name__}: {e}"
 
+def _diagnostico_privados(sesion, base_url, token, ctx_id, nombre):
+    # Solo registra en el log: lo que Moodle lista en Archivos privados y si el enlace abre
+    base = (base_url or MOODLE_URL).rstrip('/')
+    try:
+        r = sesion.post(f"{base}/webservice/rest/server.php",
+                        data={'wstoken': token, 'wsfunction': 'core_files_get_files',
+                              'moodlewsrestformat': 'json', 'contextid': ctx_id,
+                              'component': 'user', 'filearea': 'private', 'itemid': 0,
+                              'filepath': '/', 'filename': ''}, timeout=60)
+        print(f"DIAG_LISTA: {r.text[:900].replace(token, '***')}")
+    except Exception as e:
+        print(f"DIAG_LISTA error: {type(e).__name__}: {e}")
+    try:
+        u = f"{base}/webservice/pluginfile.php/{ctx_id}/user/private/{quote(nombre)}"
+        g = sesion.get(u, params={'token': token}, stream=True, timeout=60)
+        print(f"DIAG_GET status={g.status_code} tipo={g.headers.get('Content-Type')} "
+              f"largo={g.headers.get('Content-Length')} url={g.url.replace(token, '***')}")
+        g.close()
+    except Exception as e:
+        print(f"DIAG_GET error: {type(e).__name__}: {e}")
+
 def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
     url_subida = f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/upload.php"
     token = getattr(sesion, 'moodle_token', None)
@@ -513,6 +534,8 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
                 if fallo:
                     return {"error": fallo, "reintentable": False}
                 info['filearea'] = 'private'
+                _diagnostico_privados(sesion, base_url, token, info.get('contextid'),
+                                      info.get('filename') or os.path.basename(ruta_archivo))
             return info
         return None
     except Exception as e:
