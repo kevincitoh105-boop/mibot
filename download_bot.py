@@ -42,6 +42,9 @@ ADMIN_IDS = [5293884821]
 # Límites (cambio obligatorio 1 y 2)
 MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024   # 10 GB
 MAX_SPLIT_SIZE = 1024 * 1024 * 1024       # 1 GB (para dividir)
+# Limita trabajos pesados simultáneos; se puede ajustar en Render.
+MAX_CONCURRENT_UPLOADS = max(1, int(os.environ.get("MAX_CONCURRENT_UPLOADS", "1")))
+UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 
 # Cifrado Fernet (cambio obligatorio 1)
 from cryptography.fernet import Fernet
@@ -133,12 +136,17 @@ def limpiar_logs_antiguos(dias=30):
         c.execute("DELETE FROM logs WHERE fecha < ?", (limite,))
         print(f"🧹 Limpiados {c.rowcount} logs antiguos (> {dias} días)")
 
-def limpiar_archivos_temporales_antiguos(horas=1):
+def limpiar_archivos_temporales_antiguos(horas=24):
+    """Limpia temporales viejos, pero conserva durante 24 h los archivos de trabajos fallidos."""
     ahora = time.time()
     os.makedirs("temp_downloads", exist_ok=True)
     for f in os.listdir("temp_downloads"):
         ruta = os.path.join("temp_downloads", f)
-        if os.path.isfile(ruta) and (ahora - os.path.getmtime(ruta)) > horas * 3600:
+        if not os.path.isfile(ruta):
+            continue
+        # Un archivo .failed se conserva hasta 24 h para permitir recuperación manual.
+        edad_limite = 24 if f.endswith(".failed") else horas
+        if (ahora - os.path.getmtime(ruta)) > edad_limite * 3600:
             try:
                 os.remove(ruta)
                 print(f"🧹 Eliminado temporal antiguo: {ruta}")
@@ -1009,11 +1017,20 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tb = traceback.format_exc()
         log_error(user_id, f"Error procesando enlace: {str(e)}", tb)
         await update.message.reply_text(f"❌ Error: {str(e)}"[:1000])  # sin parse_mode
+        # No borrar el archivo descargado cuando falla la subida. Se conserva como
+        # .failed para recuperación durante 24 h en el disco disponible.
         try:
             if os.path.exists(ruta):
-                os.remove(ruta)
-        except:
-            pass
+                ruta_fallida = ruta + ".failed"
+                os.replace(ruta, ruta_fallida)
+                print(f"⚠️ Archivo conservado para recuperación: {ruta_fallida}")
+        except Exception as cleanup_error:
+            print(f"⚠️ No se pudo conservar el archivo fallido: {cleanup_error}")
+
+async def procesar_enlace_controlado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Limita las subidas simultáneas sin bloquear los comandos del bot."""
+    async with UPLOAD_SEMAPHORE:
+        await procesar_enlace(update, context)
 
 # ==================================================
 # SERVIDOR DE SALUD (Render Web Service necesita un puerto abierto)
@@ -1052,7 +1069,7 @@ def main():
         print("⚠️ ADVERTENCIA: '7z' no está instalado. No podrás dividir archivos >1GB.")
         print("   Instala con: sudo apt install p7zip-full")
     iniciar_servidor_salud()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(4).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setmoodle", set_moodle))
     app.add_handler(CommandHandler("cambiar", cmd_cambiar))
@@ -1064,7 +1081,7 @@ def main():
     app.add_handler(CommandHandler("mystats", mis_estadisticas))
     app.add_handler(CommandHandler("admin", panel_admin))
     app.add_handler(CallbackQueryHandler(admin_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_enlace))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_enlace_controlado))
     print("🤖 Bot iniciado.")
     print("Límite de archivo: 10 GB. Sanitización de nombres activada.")
     app.run_polling()
