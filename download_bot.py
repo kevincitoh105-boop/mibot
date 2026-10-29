@@ -7,6 +7,8 @@ import requests
 import subprocess
 import shutil
 import traceback
+import html
+import uuid
 from urllib.parse import urlparse, unquote
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -63,8 +65,13 @@ def decrypt(text: str) -> str:
 # UTILIDADES
 # ==================================================
 def escape_markdown(text: str) -> str:
-    escape_chars = r'_*[]()~>#+-=|{}.!'
-    return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
+    """Escapa solo lo que Telegram (Markdown clásico) necesita: _ * ` [
+    (antes escapaba de más y se veían barras '\\' en los mensajes)."""
+    return re.sub(r'([_*`\[])', r'\\\1', str(text))
+
+def h(text) -> str:
+    """Escapa texto para usarlo dentro de mensajes parse_mode='HTML'."""
+    return html.escape(str(text), quote=False)
 
 def sanitize_filename(name: str) -> str:
     """Elimina caracteres peligrosos (cambio obligatorio 3)"""
@@ -322,15 +329,62 @@ def login_moodle(usuario, contraseña, base_url=None):
             "sin cookie MoodleSession")
     return sesion
 
-def subir_a_moodle(sesion, ruta_archivo, base_url=None):
+class _CuerpoMultipart:
+    """Cuerpo multipart/form-data que se envía en streaming y va sumando
+    los bytes enviados en `progreso.hecho` (para el porcentaje en vivo)."""
+    def __init__(self, ruta, campo, progreso=None):
+        self.boundary = uuid.uuid4().hex
+        nombre = os.path.basename(ruta).replace('"', '_')
+        self.cabecera = (f'--{self.boundary}\r\n'
+                         f'Content-Disposition: form-data; name="{campo}"; filename="{nombre}"\r\n'
+                         f'Content-Type: application/octet-stream\r\n\r\n').encode('utf-8')
+        self.pie = f'\r\n--{self.boundary}--\r\n'.encode('utf-8')
+        self.f = open(ruta, "rb")
+        self.progreso = progreso
+        self.total = len(self.cabecera) + os.path.getsize(ruta) + len(self.pie)
+        self.fase = 0
+
+    def __len__(self):
+        return self.total
+
+    def __iter__(self):
+        return iter(lambda: self.read(256 * 1024), b'')
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = 256 * 1024
+        if self.fase == 0:
+            self.fase = 1
+            return self.cabecera
+        if self.fase == 1:
+            datos = self.f.read(size)
+            if datos:
+                if self.progreso:
+                    self.progreso.hecho += len(datos)
+                return datos
+            self.fase = 2
+        if self.fase == 2:
+            self.fase = 3
+            return self.pie
+        return b''
+
+    def close(self):
+        self.f.close()
+
+def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
     url_subida = f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/upload.php"
-    with open(ruta_archivo, "rb") as f:
-        archivos = {'file_1': f}
-        try:
-            respuesta = sesion.post(url_subida, files=archivos, timeout=120)
-            respuesta.raise_for_status()
-        except Exception as e:
-            return {"error": str(e), "traceback": traceback.format_exc()}
+    cuerpo = _CuerpoMultipart(ruta_archivo, 'file_1', progreso)
+    try:
+        # timeout=(conexión, lectura): la lectura es la espera de la respuesta del servidor
+        # una vez enviado todo el archivo (antes 120s era muy poco para archivos grandes).
+        respuesta = sesion.post(url_subida, data=cuerpo,
+                                headers={'Content-Type': f'multipart/form-data; boundary={cuerpo.boundary}'},
+                                timeout=(30, 900))
+        respuesta.raise_for_status()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
+    finally:
+        cuerpo.close()
     try:
         datos = respuesta.json()
         if isinstance(datos, dict) and 'error' in datos:
@@ -393,21 +447,92 @@ async def verificar_url(url):
         return size
     return await loop.run_in_executor(None, sync_head)
 
-async def descargar_archivo(url, destino):
+# --------------------------------------------------
+# PROGRESO EN VIVO (porcentaje, velocidad y tiempo restante)
+# --------------------------------------------------
+class Progreso:
+    """Contador compartido entre el hilo que descarga/sube y la tarea que edita el mensaje."""
+    def __init__(self, total=0):
+        self.total = total
+        self.hecho = 0
+        self.t0 = time.time()
+
+def fmt_bytes(n):
+    n = float(n)
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    return f"{n / 1024 ** 2:.1f} MB"
+
+def fmt_tiempo(seg):
+    seg = int(max(seg, 0))
+    m, s = divmod(seg, 60)
+    hh, m = divmod(m, 60)
+    return f"{hh}:{m:02d}:{s:02d}" if hh else f"{m}:{s:02d}"
+
+def texto_progreso(titulo, prog):
+    dt = max(time.time() - prog.t0, 0.001)
+    vel = prog.hecho / dt
+    if prog.total > 0:
+        pct = min(100.0, prog.hecho * 100 / prog.total)
+        llenos = int(pct * 12 / 100)
+        barra = "█" * llenos + "░" * (12 - llenos)
+        eta = (prog.total - prog.hecho) / vel if vel > 0 else 0
+        return (f"{titulo}\n[{barra}] {pct:.0f}%\n"
+                f"{fmt_bytes(prog.hecho)} / {fmt_bytes(prog.total)}\n"
+                f"⚡ {fmt_bytes(vel)}/s · ⏳ {fmt_tiempo(eta)}")
+    return f"{titulo}\n{fmt_bytes(prog.hecho)} · ⚡ {fmt_bytes(vel)}/s"
+
+async def editar_seguro(msg, texto, **kw):
+    """Edita un mensaje sin romper el flujo si Telegram se queja (mismo texto, límite, etc.)."""
+    try:
+        await msg.edit_text(texto, **kw)
+    except Exception:
+        pass
+
+async def _bucle_progreso(msg, titulo, prog, intervalo=3):
+    ultimo = ""
+    while True:
+        await asyncio.sleep(intervalo)
+        texto = texto_progreso(titulo, prog)
+        if texto != ultimo:
+            try:
+                await msg.edit_text(texto)
+                ultimo = texto
+            except Exception:
+                pass
+
+async def con_progreso(msg, titulo, prog, trabajo):
+    """Ejecuta `trabajo` (corrutina) mientras actualiza `msg` cada pocos segundos."""
+    tarea = asyncio.create_task(_bucle_progreso(msg, titulo, prog))
+    try:
+        return await trabajo
+    finally:
+        tarea.cancel()
+        try:
+            await tarea
+        except asyncio.CancelledError:
+            pass
+
+async def descargar_archivo(url, destino, prog=None):
     loop = asyncio.get_running_loop()
     def sync_download():
         # Ya verificamos tamaño antes, aquí solo descargamos
         respuesta = requests.get(url, timeout=(30, 180), stream=True)
         respuesta.raise_for_status()
+        if prog is not None and not prog.total:
+            prog.total = int(respuesta.headers.get("Content-Length", 0) or 0)
         with open(destino, "wb") as f:
-            for chunk in respuesta.iter_content(chunk_size=8192):
-                f.write(chunk)
+            for chunk in respuesta.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    if prog is not None:
+                        prog.hecho += len(chunk)
         return os.path.getsize(destino)
     return await loop.run_in_executor(None, sync_download)
 
-async def subir_archivo_a_moodle(sesion, ruta, base_url=None):
+async def subir_archivo_a_moodle(sesion, ruta, base_url=None, prog=None):
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url)
+    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url, prog)
 
 async def dividir_archivo_async(ruta):
     loop = asyncio.get_running_loop()
@@ -745,14 +870,14 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2. Verificar tamaño, espacio y tipo (cambios obligatorios 1,2 y extra)
     try:
-        await update.message.reply_text("📏 Verificando tamaño y disponibilidad...", parse_mode='Markdown')
+        await update.message.reply_text("📏 Verificando tamaño y disponibilidad...")
         size = await verificar_url(enlace)
-        await update.message.reply_text(f"✅ Tamaño del archivo: {size/(1024**3):.2f} GB", parse_mode='Markdown')
+        await update.message.reply_text(f"✅ Tamaño del archivo: {fmt_bytes(size)}")
     except Exception as e:
-        await update.message.reply_text(f"❌ {str(e)}", parse_mode='Markdown')
+        await update.message.reply_text(f"❌ {str(e)}")
         return
 
-    # 3. Login ANTES de descargar: si Moodle está caído o las credenciales están mal,
+    # 3. Login ANTES de descargar: si la nube está caída o las credenciales están mal,
     #    fallamos ya, sin gastar tiempo ni disco descargando el archivo.
     try:
         await update.message.reply_text(f"🔐 Iniciando sesión en {cfg['nombre']}...")
@@ -770,29 +895,47 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nombre_archivo = f"{user_id}_{int(time.time())}_{nombre_base}"
     ruta = os.path.join("temp_downloads", nombre_archivo)
 
-    await update.message.reply_text(f"📥 *Descargando* `{escape_markdown(nombre_base)}` ...", parse_mode='Markdown')
+    def subida_ok(res):
+        return isinstance(res, dict) and 'itemid' in res and 'error' not in res
+
+    async def subir_con_progreso(ruta_local, etiqueta):
+        """Sube un archivo mostrando el porcentaje en vivo en un mensaje que se va editando."""
+        prog = Progreso(os.path.getsize(ruta_local))
+        titulo = f"☁️ Subiendo {etiqueta} a {cfg['nombre']}"
+        msg = await update.message.reply_text(texto_progreso(titulo, prog))
+        res = await con_progreso(msg, titulo, prog,
+                                 subir_archivo_a_moodle(sesion, ruta_local, base_url, prog))
+        if subida_ok(res):
+            await editar_seguro(msg, f"✅ {etiqueta} subido (100%)")
+        else:
+            await editar_seguro(msg, f"❌ Falló la subida de {etiqueta}")
+        return res
+
     try:
-        tamano = await descargar_archivo(enlace, ruta)
-        await update.message.reply_text(f"✅ Descargado: `{escape_markdown(nombre_base)}` ({tamano/(1024**2):.1f} MB)", parse_mode='Markdown')
+        # --- DESCARGA con progreso en vivo ---
+        prog_dl = Progreso(size)
+        titulo_dl = f"📥 Descargando {nombre_base}"
+        msg_dl = await update.message.reply_text(texto_progreso(titulo_dl, prog_dl))
+        tamano = await con_progreso(msg_dl, titulo_dl, prog_dl, descargar_archivo(enlace, ruta, prog_dl))
+        await editar_seguro(msg_dl, f"✅ Descargado: {nombre_base} ({fmt_bytes(tamano)}) 100%")
 
         # Dividir si excede 1GB
         if tamano > MAX_SPLIT_SIZE:
             if not shutil.which('7z'):
-                await update.message.reply_text("❌ El VPS no tiene '7z' instalado. No puedo dividir archivos >1GB.", parse_mode='Markdown')
+                await update.message.reply_text("❌ El VPS no tiene '7z' instalado. No puedo dividir archivos >1GB.")
                 os.remove(ruta)
                 return
-            await update.message.reply_text("📦 Archivo >1GB, dividiendo en partes de 1GB...", parse_mode='Markdown')
+            await update.message.reply_text("📦 Archivo >1GB, dividiendo en partes de 1GB...")
             partes = await dividir_archivo_async(ruta)
             if not partes:
-                await update.message.reply_text("❌ Error al dividir el archivo. Ver logs del VPS.", parse_mode='Markdown')
+                await update.message.reply_text("❌ Error al dividir el archivo. Ver logs del VPS.")
                 os.remove(ruta)
                 return
             enlaces = []
             for i, parte in enumerate(partes, 1):
                 try:
-                    await update.message.reply_text(f"☁️ Subiendo parte {i}/{len(partes)}...", parse_mode='Markdown')
-                    res = await subir_archivo_a_moodle(sesion, parte, base_url)
-                    if res and not isinstance(res, dict) and 'itemid' in res:
+                    res = await subir_con_progreso(parte, f"parte {i}/{len(partes)}")
+                    if subida_ok(res):
                         url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{os.path.basename(parte)}"
                         enlaces.append(url)
                         with get_db_conn() as conn:
@@ -802,41 +945,42 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       (user_id, f"{nombre_base}.part{i}", os.path.basename(parte), res['itemid'], res['userid'], url, os.path.getsize(parte), datetime.now()))
                         log_action(user_id, "subida", f"Parte {i} de {nombre_base}")
                     elif isinstance(res, dict) and 'error' in res:
-                        await update.message.reply_text(f"⚠️ Error Moodle parte {i}: {res.get('error', 'Desconocido')}", parse_mode='Markdown')
+                        await update.message.reply_text(f"⚠️ Error de {cfg['nombre']} en la parte {i}: {str(res.get('error', 'Desconocido'))[:500]}")
                         log_error(user_id, f"Subida parte {i} falló", res.get('traceback', ''))
                     else:
-                        await update.message.reply_text(f"⚠️ Error subiendo parte {i}", parse_mode='Markdown')
+                        await update.message.reply_text(f"⚠️ Error subiendo parte {i}")
                 finally:
                     if os.path.exists(parte):
                         os.remove(parte)
             os.remove(ruta)
             if enlaces:
-                msg = f"📎 *{escape_markdown(nombre_base)}* - Partes:\n\n" + "\n".join(f"`{e}`" for e in enlaces)
-                await update.message.reply_text(msg, parse_mode='Markdown')
+                msg = f"📎 <b>{h(nombre_base)}</b> - Partes:\n\n" + "\n".join(f"<code>{h(e)}</code>" for e in enlaces)
+                await update.message.reply_text(msg[:4000], parse_mode='HTML')
             else:
-                await update.message.reply_text("❌ No se pudo subir ninguna parte", parse_mode='Markdown')
+                await update.message.reply_text("❌ No se pudo subir ninguna parte")
         else:
-            await update.message.reply_text(f"☁️ Subiendo a {cfg['nombre']}...")
-            res = await subir_archivo_a_moodle(sesion, ruta, base_url)
-            if res and not isinstance(res, dict) and 'itemid' in res:
+            # --- SUBIDA con progreso en vivo ---
+            res = await subir_con_progreso(ruta, nombre_base)
+            if subida_ok(res):
                 url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{nombre_base}"
                 with get_db_conn() as conn:
                     c = conn.cursor()
                     c.execute('''INSERT INTO archivos (telegram_id, nombre_original, nombre_en_moodle, itemid, userid, enlace, tamano_bytes, fecha_subida)
                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                               (user_id, nombre_base, nombre_base, res['itemid'], res['userid'], url, tamano, datetime.now()))
-                await update.message.reply_text(f"✅ *Subido exitosamente*\n\n`{url}`", parse_mode='Markdown')
+                await update.message.reply_text(f"✅ <b>Subido exitosamente</b>\n\n<code>{h(url)}</code>", parse_mode='HTML')
                 log_action(user_id, "subida", f"{nombre_base} ({tamano/(1024**2):.1f}MB)")
             elif isinstance(res, dict) and 'error' in res:
-                await update.message.reply_text(f"❌ Error de Moodle: {res.get('error', 'Desconocido')}", parse_mode='Markdown')
-                log_error(user_id, "Error de Moodle en subida", res.get('traceback', ''))
+                # Texto plano: el error de la nube puede traer _ * ` y romper el Markdown
+                await update.message.reply_text(f"❌ Error de {cfg['nombre']}: {str(res.get('error', 'Desconocido'))[:500]}")
+                log_error(user_id, "Error de la nube en subida", res.get('traceback', ''))
             else:
-                await update.message.reply_text("❌ Error al subir a Moodle", parse_mode='Markdown')
+                await update.message.reply_text(f"❌ Error al subir a {cfg['nombre']}")
             os.remove(ruta)
     except Exception as e:
         tb = traceback.format_exc()
         log_error(user_id, f"Error procesando enlace: {str(e)}", tb)
-        await update.message.reply_text(f"❌ Error: {str(e)}", parse_mode='Markdown')
+        await update.message.reply_text(f"❌ Error: {str(e)}"[:1000])  # sin parse_mode
         try:
             if os.path.exists(ruta):
                 os.remove(ruta)
@@ -899,4 +1043,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
