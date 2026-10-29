@@ -34,7 +34,7 @@ if not BOT_TOKEN:
 
 MOODLE_URL = "https://moodle.instec.cu"
 # 'private' = Archivos privados del usuario (descargables con token); 'draft' = borrador temporal
-MOODLE_FILEAREA = os.environ.get("MOODLE_FILEAREA", "private")
+MOODLE_FILEAREA = os.environ.get("MOODLE_FILEAREA", "draft")
 
 # ==================================================
 # NUBES DISPONIBLES (/cambiar). Para añadir otra: una entrada nueva aquí.
@@ -975,9 +975,10 @@ async def procesar_job(bot, job):
                         if MOODLE_FILEAREA == 'private':
                             url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/private{quote(ruta_srv)}{quote(nom_srv)}"
                         else:
-                            url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
+                            # Borrador: se abre con la sesion de Moodle iniciada (draftfile.php), sin token
+                            url = f"{base_url}/draftfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
                         tok_srv = getattr(sesion, 'moodle_token', None)
-                        if tok_srv:
+                        if tok_srv and MOODLE_FILEAREA == 'private':
                             url += f"?token={tok_srv}"
                         enlaces.append(url)
                         filas.append((uid, f"{nombre_base}.part{i}" if dividir else nombre_base, nom,
