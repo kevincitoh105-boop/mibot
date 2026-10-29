@@ -20,6 +20,18 @@ if not BOT_TOKEN:
     raise ValueError("No se encontró BOT_TOKEN en variables de entorno.")
 
 MOODLE_URL = "https://moodle.instec.cu"
+
+# ==================================================
+# NUBES DISPONIBLES (/cambiar). Para añadir otra: una entrada nueva aquí.
+#   requiere_cuenta=True  -> pide usuario/contraseña (/setmoodle)
+#   requiere_cuenta=False -> reservado para nubes sin credenciales (aún no hay ninguna)
+# ==================================================
+CLOUDS = {
+    1: {"nombre": "Moodle INSTEC", "url": MOODLE_URL, "requiere_cuenta": True},
+    2: {"nombre": "EVA Desoft", "url": os.environ.get("EVA_URL", "https://eva.desoft.cu").rstrip("/"),
+        "requiere_cuenta": True},
+}
+NUBE_POR_DEFECTO = 1
 ADMIN_IDS = [5293884821]
 
 # Límites (cambio obligatorio 1 y 2)
@@ -80,6 +92,14 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS logs
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER, 
                       accion TEXT, detalle TEXT, fecha TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS credenciales_nube
+                     (telegram_id INTEGER, nube INTEGER, usuario TEXT, contraseña TEXT,
+                      PRIMARY KEY (telegram_id, nube))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS preferencias
+                     (telegram_id INTEGER PRIMARY KEY, nube INTEGER)''')
+        # Migración: las credenciales Moodle que ya tenías pasan a la nube 1
+        c.execute('''INSERT OR IGNORE INTO credenciales_nube (telegram_id, nube, usuario, contraseña)
+                     SELECT telegram_id, 1, usuario, contraseña FROM credenciales_moodle''')
         c.execute("CREATE INDEX IF NOT EXISTS idx_logs_fecha ON logs(fecha)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_logs_telegram ON logs(telegram_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_archivos_user ON archivos(telegram_id)")
@@ -118,10 +138,25 @@ def limpiar_archivos_temporales_antiguos(horas=1):
 def es_admin(telegram_id):
     return telegram_id in ADMIN_IDS
 
-def obtener_credenciales_moodle(telegram_id):
+def obtener_nube_activa(telegram_id):
     with get_db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT usuario, contraseña FROM credenciales_moodle WHERE telegram_id = ?", (telegram_id,))
+        c.execute("SELECT nube FROM preferencias WHERE telegram_id = ?", (telegram_id,))
+        r = c.fetchone()
+    return r[0] if r and r[0] in CLOUDS else NUBE_POR_DEFECTO
+
+def guardar_nube_activa(telegram_id, nube):
+    with get_db_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO preferencias (telegram_id, nube) VALUES (?, ?)",
+                     (telegram_id, nube))
+
+def obtener_credenciales_moodle(telegram_id, nube=None):
+    if nube is None:
+        nube = obtener_nube_activa(telegram_id)
+    with get_db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT usuario, contraseña FROM credenciales_nube WHERE telegram_id = ? AND nube = ?",
+                  (telegram_id, nube))
         resultado = c.fetchone()
     if resultado:
         usuario = resultado[0]
@@ -133,13 +168,15 @@ def obtener_credenciales_moodle(telegram_id):
         return (usuario, contraseña)
     return (None, None)
 
-def guardar_credenciales_moodle(telegram_id, usuario, contraseña):
+def guardar_credenciales_moodle(telegram_id, usuario, contraseña, nube=None):
+    if nube is None:
+        nube = obtener_nube_activa(telegram_id)
     if CIPHER_KEY:
         contraseña = encrypt(contraseña)
     with get_db_conn() as conn:
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO credenciales_moodle (telegram_id, usuario, contraseña) VALUES (?, ?, ?)",
-                  (telegram_id, usuario, contraseña))
+        c.execute("INSERT OR REPLACE INTO credenciales_nube (telegram_id, nube, usuario, contraseña) VALUES (?, ?, ?, ?)",
+                  (telegram_id, nube, usuario, contraseña))
 
 # ==================================================
 # FUNCIONES DE MOODLE CON REINTENTOS
@@ -219,7 +256,7 @@ def clasificar_error_conexion(e):
         msg = f"⚠️ Error inesperado al contactar a Moodle ({type(e).__name__}). {_SIN_VERIFICAR}"
     return MoodleConexionError(msg, f"{type(e).__name__}: {texto}")
 
-def login_moodle(usuario, contraseña):
+def login_moodle(usuario, contraseña, base_url=None):
     """Inicia sesión en Moodle y devuelve la sesión.
 
     Si falla, lanza una excepción que dice exactamente qué pasó:
@@ -227,8 +264,9 @@ def login_moodle(usuario, contraseña):
       - MoodleRespuestaError:   Moodle responde pero la página no es la esperada
       - MoodleCredencialesError: Moodle respondió y rechazó usuario/contraseña
     """
+    base_url = (base_url or MOODLE_URL).rstrip("/")
     sesion = create_session()
-    login_url = f"{MOODLE_URL}/login/index.php"
+    login_url = f"{base_url}/login/index.php"
 
     # 1. Pedir la página de login (aquí se nota si Moodle está caído o bloquea)
     try:
@@ -284,8 +322,8 @@ def login_moodle(usuario, contraseña):
             "sin cookie MoodleSession")
     return sesion
 
-def subir_a_moodle(sesion, ruta_archivo):
-    url_subida = f"{MOODLE_URL}/webservice/upload.php"
+def subir_a_moodle(sesion, ruta_archivo, base_url=None):
+    url_subida = f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/upload.php"
     with open(ruta_archivo, "rb") as f:
         archivos = {'file_1': f}
         try:
@@ -367,9 +405,9 @@ async def descargar_archivo(url, destino):
         return os.path.getsize(destino)
     return await loop.run_in_executor(None, sync_download)
 
-async def subir_archivo_a_moodle(sesion, ruta):
+async def subir_archivo_a_moodle(sesion, ruta, base_url=None):
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta)
+    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url)
 
 async def dividir_archivo_async(ruta):
     loop = asyncio.get_running_loop()
@@ -389,8 +427,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("INSERT OR IGNORE INTO usuarios (telegram_id, username, fecha_registro, ultimo_uso) VALUES (?, ?, ?, ?)",
                       (user_id, username, datetime.now(), datetime.now()))
             c.execute("UPDATE usuarios SET ultimo_uso = ? WHERE telegram_id = ?", (datetime.now(), user_id))
-        user, pwd = obtener_credenciales_moodle(user_id)
-        estado = "✅ Moodle conectado" if user else "❌ Usa /setmoodle usuario contraseña"
+        nube = obtener_nube_activa(user_id)
+        user, pwd = obtener_credenciales_moodle(user_id, nube)
+        nombre_nube = CLOUDS[nube]["nombre"]
+        estado = (f"☁️ Nube activa: {nombre_nube}\n"
+                  + ("✅ Cuenta conectada" if user else "❌ Usa /setmoodle usuario contraseña"))
         await update.message.reply_text(
             f"🤖 *Bot de Nube Moodle*\n\n"
             f"{estado}\n\n"
@@ -400,13 +441,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/del `ID` - Borrar registro\n"
             f"/delall - Borrar todos tus registros\n"
             f"/mystats - Estadísticas\n"
-            f"/setmoodle - Guardar cuenta\n\n"
+            f"/setmoodle - Guardar cuenta de la nube activa\n"
+            f"/cambiar - Cambiar de nube\n\n"
             f"💬 Envíame un *ENLACE* para subirlo\n"
             f"_Máximo 10 GB por archivo_",
             parse_mode='Markdown'
         )
     except Exception as e:
         log_error(user_id, "Error en start", traceback.format_exc())
+        await update.message.reply_text("❌ Error interno.")
+
+async def cmd_cambiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    activa = obtener_nube_activa(update.effective_user.id)
+    lineas = ["☁️ Elige la nube de subida:\n"]
+    for k, cfg in CLOUDS.items():
+        marca = " ✅ (activa)" if k == activa else ""
+        extra = "" if cfg["requiere_cuenta"] else " (sin credenciales)"
+        lineas.append(f"/{k} - {cfg['nombre']}{extra}{marca}")
+    await update.message.reply_text("\n".join(lineas))
+
+async def cmd_elegir_nube(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja /1, /2, ... (acepta también /1@nombre_bot)."""
+    if not update.message or not update.message.text:
+        return
+    user_id = update.effective_user.id
+    m = re.match(r'^/(\d+)', update.message.text.strip())
+    nube = int(m.group(1)) if m else None
+    if nube not in CLOUDS:
+        await update.message.reply_text("❌ Esa nube no existe. Usa /cambiar para ver las disponibles.")
+        return
+    try:
+        guardar_nube_activa(user_id, nube)
+        cfg = CLOUDS[nube]
+        usuario, _ = obtener_credenciales_moodle(user_id, nube)
+        if cfg["requiere_cuenta"] and not usuario:
+            aviso = "\n❌ Aún no tienes cuenta guardada aquí. Usa /setmoodle usuario contraseña"
+        elif cfg["requiere_cuenta"]:
+            aviso = f"\n✅ Cuenta guardada: {usuario}"
+        else:
+            aviso = "\n✅ No necesita credenciales"
+        await update.message.reply_text(f"☁️ Nube activa: {cfg['nombre']}{aviso}\n\nEnvíame un enlace para subirlo.")
+        log_action(user_id, "cambiar_nube", cfg["nombre"])
+    except Exception:
+        log_error(user_id, "Error en cambiar nube", traceback.format_exc())
         await update.message.reply_text("❌ Error interno.")
 
 async def set_moodle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,12 +496,14 @@ async def set_moodle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Uso: /setmoodle usuario contraseña", parse_mode='Markdown')
         return
     usuario, contraseña = context.args[0], context.args[1]
-    await update.message.reply_text("🔐 Probando conexión...", parse_mode='Markdown')
+    nube = obtener_nube_activa(user_id)
+    cfg = CLOUDS[nube]
+    await update.message.reply_text(f"🔐 Probando conexión con {cfg['nombre']}...")
     try:
-        # En un hilo aparte para no bloquear al bot mientras Moodle responde
-        await asyncio.to_thread(login_moodle, usuario, contraseña)
-        guardar_credenciales_moodle(user_id, usuario, contraseña)
-        await update.message.reply_text(f"✅ Credenciales guardadas para: `{escape_markdown(usuario)}`", parse_mode='Markdown')
+        # En un hilo aparte para no bloquear al bot mientras la nube responde
+        await asyncio.to_thread(login_moodle, usuario, contraseña, cfg["url"])
+        guardar_credenciales_moodle(user_id, usuario, contraseña, nube)
+        await update.message.reply_text(f"✅ Credenciales de {cfg['nombre']} guardadas para: `{escape_markdown(usuario)}`", parse_mode='Markdown')
         log_action(user_id, "set_moodle", usuario)
     except MoodleError as e:
         log_action(user_id, "login_error", f"{type(e).__name__}: {e.detalle}"[:300])
@@ -627,6 +708,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 c.execute("DELETE FROM logs")
                 c.execute("DELETE FROM usuarios")
                 c.execute("DELETE FROM credenciales_moodle")
+                c.execute("DELETE FROM credenciales_nube")
+                c.execute("DELETE FROM preferencias")
                 await query.edit_message_text("💀 *NUKE COMPLETO* - Todos los datos eliminados.", parse_mode='Markdown')
             elif data == "adm_nuke_cancel":
                 await query.edit_message_text("❌ Operación cancelada.", parse_mode='Markdown')
@@ -644,9 +727,12 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enlace = update.message.text
     if enlace.startswith("/") or not enlace.startswith("http"):
         return
-    usuario, contraseña = obtener_credenciales_moodle(user_id)
+    nube = obtener_nube_activa(user_id)
+    cfg = CLOUDS[nube]
+    base_url = cfg["url"]
+    usuario, contraseña = obtener_credenciales_moodle(user_id, nube)
     if not usuario:
-        await update.message.reply_text("❌ Primero usa /setmoodle usuario contraseña", parse_mode='Markdown')
+        await update.message.reply_text(f"❌ Nube activa: {cfg['nombre']}. Primero usa /setmoodle usuario contraseña (o /cambiar para elegir otra nube)")
         return
 
     # 1. Extraer nombre base
@@ -669,8 +755,8 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3. Login ANTES de descargar: si Moodle está caído o las credenciales están mal,
     #    fallamos ya, sin gastar tiempo ni disco descargando el archivo.
     try:
-        await update.message.reply_text("🔐 Iniciando sesión en Moodle...", parse_mode='Markdown')
-        sesion = await asyncio.to_thread(login_moodle, usuario, contraseña)
+        await update.message.reply_text(f"🔐 Iniciando sesión en {cfg['nombre']}...")
+        sesion = await asyncio.to_thread(login_moodle, usuario, contraseña, base_url)
     except MoodleError as e:
         log_action(user_id, "login_error", f"{type(e).__name__}: {e.detalle}"[:300])
         await update.message.reply_text(e.usuario_msg)
@@ -705,9 +791,9 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, parte in enumerate(partes, 1):
                 try:
                     await update.message.reply_text(f"☁️ Subiendo parte {i}/{len(partes)}...", parse_mode='Markdown')
-                    res = await subir_archivo_a_moodle(sesion, parte)
+                    res = await subir_archivo_a_moodle(sesion, parte, base_url)
                     if res and not isinstance(res, dict) and 'itemid' in res:
-                        url = f"{MOODLE_URL}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{os.path.basename(parte)}"
+                        url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{os.path.basename(parte)}"
                         enlaces.append(url)
                         with get_db_conn() as conn:
                             c = conn.cursor()
@@ -730,10 +816,10 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("❌ No se pudo subir ninguna parte", parse_mode='Markdown')
         else:
-            await update.message.reply_text("☁️ Subiendo a Moodle...", parse_mode='Markdown')
-            res = await subir_archivo_a_moodle(sesion, ruta)
+            await update.message.reply_text(f"☁️ Subiendo a {cfg['nombre']}...")
+            res = await subir_archivo_a_moodle(sesion, ruta, base_url)
             if res and not isinstance(res, dict) and 'itemid' in res:
-                url = f"{MOODLE_URL}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{nombre_base}"
+                url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{nombre_base}"
                 with get_db_conn() as conn:
                     c = conn.cursor()
                     c.execute('''INSERT INTO archivos (telegram_id, nombre_original, nombre_en_moodle, itemid, userid, enlace, tamano_bytes, fecha_subida)
@@ -756,6 +842,7 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(ruta)
         except:
             pass
+
 # ==================================================
 # SERVIDOR DE SALUD (Render Web Service necesita un puerto abierto)
 # ==================================================
@@ -796,6 +883,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setmoodle", set_moodle))
+    app.add_handler(CommandHandler("cambiar", cmd_cambiar))
+    app.add_handler(MessageHandler(filters.Regex(r'^/\d+(@\w+)?\s*$'), cmd_elegir_nube))
     app.add_handler(CommandHandler("files", listar_archivos))
     app.add_handler(CommandHandler("txt", cmd_txt))
     app.add_handler(CommandHandler("del", cmd_del))
