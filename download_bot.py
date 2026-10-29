@@ -33,6 +33,8 @@ if not BOT_TOKEN:
     raise ValueError("No se encontró BOT_TOKEN en variables de entorno.")
 
 MOODLE_URL = "https://moodle.instec.cu"
+# 'private' = Archivos privados del usuario (descargables con token); 'draft' = borrador temporal
+MOODLE_FILEAREA = os.environ.get("MOODLE_FILEAREA", "private")
 
 # ==================================================
 # NUBES DISPONIBLES (/cambiar). Para añadir otra: una entrada nueva aquí.
@@ -468,7 +470,8 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
                 "reintentable": False}
     cuerpo = _CuerpoMultipart(ruta_archivo, 'file_1', progreso)
     try:
-        respuesta = sesion.post(url_subida, params={'token': token}, data=cuerpo,
+        respuesta = sesion.post(url_subida,
+                                params={'token': token, 'filearea': MOODLE_FILEAREA}, data=cuerpo,
                                 headers={'Content-Type': f'multipart/form-data; boundary={cuerpo.boundary}'},
                                 timeout=(30, 900))
         respuesta.raise_for_status()
@@ -925,7 +928,10 @@ async def procesar_job(bot, job):
                             ruta_srv = '/' + ruta_srv
                         if not ruta_srv.endswith('/'):
                             ruta_srv += '/'
-                        url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
+                        if MOODLE_FILEAREA == 'private':
+                            url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/private{quote(ruta_srv)}{quote(nom_srv)}"
+                        else:
+                            url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
                         tok_srv = getattr(sesion, 'moodle_token', None)
                         if tok_srv:
                             url += f"?token={tok_srv}"
