@@ -939,7 +939,9 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prog_dl = Progreso(size)
         titulo_dl = f"📥 Descargando {nombre_base}"
         msg_dl = await update.message.reply_text(texto_progreso(titulo_dl, prog_dl))
-        tamano = await con_progreso(msg_dl, titulo_dl, prog_dl, descargar_archivo(enlace, ruta, prog_dl))
+        ruta_descarga = ruta + ".part"
+        tamano = await con_progreso(msg_dl, titulo_dl, prog_dl, descargar_archivo(enlace, ruta_descarga, prog_dl))
+        os.replace(ruta_descarga, ruta)
         await editar_seguro(msg_dl, f"✅ Descargado: {nombre_base} ({fmt_bytes(tamano)}) 100%")
 
         limite = cfg.get("max_parte") or MAX_SPLIT_SIZE
@@ -1036,12 +1038,12 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # No borrar el archivo descargado cuando falla la subida. Se conserva como
         # .failed para recuperación durante 24 h en el disco disponible.
         try:
-            if os.path.exists(ruta):
-                ruta_fallida = ruta + ".failed"
-                os.replace(ruta, ruta_fallida)
-                print(f"⚠️ Archivo conservado para recuperación: {ruta_fallida}")
+            ruta_parcial = ruta + ".part"
+            if os.path.exists(ruta_parcial):
+                os.remove(ruta_parcial)
+            conservar_archivo_fallido(ruta)
         except Exception as cleanup_error:
-            print(f"⚠️ No se pudo conservar el archivo fallido: {cleanup_error}")
+            print(f"⚠️ No se pudo limpiar/conservar el archivo fallido: {cleanup_error}")
 
 async def procesar_enlace_controlado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Limita las subidas simultáneas sin bloquear los comandos del bot."""
