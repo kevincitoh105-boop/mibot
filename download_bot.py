@@ -31,7 +31,10 @@ MOODLE_URL = "https://moodle.instec.cu"
 CLOUDS = {
     1: {"nombre": "Moodle INSTEC", "url": MOODLE_URL, "requiere_cuenta": True},
     2: {"nombre": "EVA Desoft", "url": os.environ.get("EVA_URL", "https://eva.desoft.cu").rstrip("/"),
-        "requiere_cuenta": True},
+        "requiere_cuenta": True,
+        # EVA responde 413 con archivos grandes: se sube en partes de este tamaño
+        # (si aún da 413 el bot lo reduce solo). Ajustable con EVA_MAX_PART_MB.
+        "max_parte": int(os.environ.get("EVA_MAX_PART_MB", "50")) * 1024 * 1024},
 }
 NUBE_POR_DEFECTO = 1
 ADMIN_IDS = [5293884821]
@@ -395,10 +398,9 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
     except Exception as e:
         return {"error": f"JSON decode: {e}", "traceback": traceback.format_exc()}
 
-def dividir_archivo(ruta_archivo, tamano_parte_gb=1):
+def dividir_archivo(ruta_archivo, tamano_bytes=1024 * 1024 * 1024):
     if not shutil.which('7z'):
         return []
-    tamano_bytes = tamano_parte_gb * 1024 * 1024 * 1024
     nombre_base = ruta_archivo + ".7z"
     cmd = ['7z', 'a', '-v{}b'.format(tamano_bytes), nombre_base, ruta_archivo]
     try:
@@ -534,9 +536,9 @@ async def subir_archivo_a_moodle(sesion, ruta, base_url=None, prog=None):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url, prog)
 
-async def dividir_archivo_async(ruta):
+async def dividir_archivo_async(ruta, tamano_bytes=1024 * 1024 * 1024):
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, dividir_archivo, ruta)
+    return await loop.run_in_executor(None, dividir_archivo, ruta, tamano_bytes)
 
 # ==================================================
 # COMANDOS (con los 6 cambios aplicados)
@@ -919,64 +921,90 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tamano = await con_progreso(msg_dl, titulo_dl, prog_dl, descargar_archivo(enlace, ruta, prog_dl))
         await editar_seguro(msg_dl, f"✅ Descargado: {nombre_base} ({fmt_bytes(tamano)}) 100%")
 
-        # Dividir si excede 1GB
-        if tamano > MAX_SPLIT_SIZE:
-            if not shutil.which('7z'):
-                await update.message.reply_text("❌ El VPS no tiene '7z' instalado. No puedo dividir archivos >1GB.")
-                os.remove(ruta)
-                return
-            await update.message.reply_text("📦 Archivo >1GB, dividiendo en partes de 1GB...")
-            partes = await dividir_archivo_async(ruta)
-            if not partes:
-                await update.message.reply_text("❌ Error al dividir el archivo. Ver logs del VPS.")
-                os.remove(ruta)
-                return
-            enlaces = []
-            for i, parte in enumerate(partes, 1):
-                try:
-                    res = await subir_con_progreso(parte, f"parte {i}/{len(partes)}")
-                    if subida_ok(res):
-                        url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{os.path.basename(parte)}"
-                        enlaces.append(url)
-                        with get_db_conn() as conn:
-                            c = conn.cursor()
-                            c.execute('''INSERT INTO archivos (telegram_id, nombre_original, nombre_en_moodle, itemid, userid, enlace, tamano_bytes, fecha_subida)
-                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                                      (user_id, f"{nombre_base}.part{i}", os.path.basename(parte), res['itemid'], res['userid'], url, os.path.getsize(parte), datetime.now()))
-                        log_action(user_id, "subida", f"Parte {i} de {nombre_base}")
-                    elif isinstance(res, dict) and 'error' in res:
-                        await update.message.reply_text(f"⚠️ Error de {cfg['nombre']} en la parte {i}: {str(res.get('error', 'Desconocido'))[:500]}")
-                        log_error(user_id, f"Subida parte {i} falló", res.get('traceback', ''))
+        limite = cfg.get("max_parte") or MAX_SPLIT_SIZE
+        while True:
+            demasiado_grande = False  # el servidor respondió 413
+            if tamano > limite:
+                if not shutil.which('7z'):
+                    await update.message.reply_text("❌ El VPS no tiene '7z' instalado. No puedo dividir el archivo.")
+                    os.remove(ruta)
+                    return
+                await update.message.reply_text(f"📦 Dividiendo en partes de {fmt_bytes(limite)}...")
+                partes = await dividir_archivo_async(ruta, limite)
+                if not partes:
+                    await update.message.reply_text("❌ Error al dividir el archivo. Ver logs del VPS.")
+                    os.remove(ruta)
+                    return
+                enlaces = []
+                for i, parte in enumerate(partes, 1):
+                    try:
+                        res = await subir_con_progreso(parte, f"parte {i}/{len(partes)}")
+                        if subida_ok(res):
+                            url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{os.path.basename(parte)}"
+                            enlaces.append(url)
+                            with get_db_conn() as conn:
+                                c = conn.cursor()
+                                c.execute('''INSERT INTO archivos (telegram_id, nombre_original, nombre_en_moodle, itemid, userid, enlace, tamano_bytes, fecha_subida)
+                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                          (user_id, f"{nombre_base}.part{i}", os.path.basename(parte), res['itemid'], res['userid'], url, os.path.getsize(parte), datetime.now()))
+                            log_action(user_id, "subida", f"Parte {i} de {nombre_base}")
+                        elif isinstance(res, dict) and 'error' in res:
+                            if '413' in str(res.get('error')):
+                                demasiado_grande = True
+                                break
+                            await update.message.reply_text(f"⚠️ Error de {cfg['nombre']} en la parte {i}: {str(res.get('error', 'Desconocido'))[:500]}")
+                            log_error(user_id, f"Subida parte {i} falló", res.get('traceback', ''))
+                        else:
+                            await update.message.reply_text(f"⚠️ Error subiendo parte {i}")
+                    finally:
+                        if os.path.exists(parte):
+                            os.remove(parte)
+                for p in partes:  # limpiar las que no se llegaron a subir
+                    if os.path.exists(p):
+                        os.remove(p)
+                if not demasiado_grande:
+                    os.remove(ruta)
+                    if enlaces:
+                        msg = f"📎 <b>{h(nombre_base)}</b> - Partes (únelas con 7-Zip):\n\n" + "\n".join(f"<code>{h(e)}</code>" for e in enlaces)
+                        await update.message.reply_text(msg[:4000], parse_mode='HTML')
                     else:
-                        await update.message.reply_text(f"⚠️ Error subiendo parte {i}")
-                finally:
-                    if os.path.exists(parte):
-                        os.remove(parte)
-            os.remove(ruta)
-            if enlaces:
-                msg = f"📎 <b>{h(nombre_base)}</b> - Partes:\n\n" + "\n".join(f"<code>{h(e)}</code>" for e in enlaces)
-                await update.message.reply_text(msg[:4000], parse_mode='HTML')
+                        await update.message.reply_text("❌ No se pudo subir ninguna parte")
+                    return
             else:
-                await update.message.reply_text("❌ No se pudo subir ninguna parte")
-        else:
-            # --- SUBIDA con progreso en vivo ---
-            res = await subir_con_progreso(ruta, nombre_base)
-            if subida_ok(res):
-                url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{nombre_base}"
-                with get_db_conn() as conn:
-                    c = conn.cursor()
-                    c.execute('''INSERT INTO archivos (telegram_id, nombre_original, nombre_en_moodle, itemid, userid, enlace, tamano_bytes, fecha_subida)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                              (user_id, nombre_base, nombre_base, res['itemid'], res['userid'], url, tamano, datetime.now()))
-                await update.message.reply_text(f"✅ <b>Subido exitosamente</b>\n\n<code>{h(url)}</code>", parse_mode='HTML')
-                log_action(user_id, "subida", f"{nombre_base} ({tamano/(1024**2):.1f}MB)")
-            elif isinstance(res, dict) and 'error' in res:
-                # Texto plano: el error de la nube puede traer _ * ` y romper el Markdown
-                await update.message.reply_text(f"❌ Error de {cfg['nombre']}: {str(res.get('error', 'Desconocido'))[:500]}")
-                log_error(user_id, "Error de la nube en subida", res.get('traceback', ''))
-            else:
-                await update.message.reply_text(f"❌ Error al subir a {cfg['nombre']}")
-            os.remove(ruta)
+                res = await subir_con_progreso(ruta, nombre_base)
+                if subida_ok(res):
+                    url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{nombre_base}"
+                    with get_db_conn() as conn:
+                        c = conn.cursor()
+                        c.execute('''INSERT INTO archivos (telegram_id, nombre_original, nombre_en_moodle, itemid, userid, enlace, tamano_bytes, fecha_subida)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                  (user_id, nombre_base, nombre_base, res['itemid'], res['userid'], url, tamano, datetime.now()))
+                    await update.message.reply_text(f"✅ <b>Subido exitosamente</b>\n\n<code>{h(url)}</code>", parse_mode='HTML')
+                    log_action(user_id, "subida", f"{nombre_base} ({tamano/(1024**2):.1f}MB)")
+                    os.remove(ruta)
+                    return
+                elif isinstance(res, dict) and 'error' in res:
+                    if '413' in str(res.get('error')):
+                        demasiado_grande = True
+                    else:
+                        await update.message.reply_text(f"❌ Error de {cfg['nombre']}: {str(res.get('error', 'Desconocido'))[:500]}")
+                        log_error(user_id, "Error de la nube en subida", res.get('traceback', ''))
+                        os.remove(ruta)
+                        return
+                else:
+                    await update.message.reply_text(f"❌ Error al subir a {cfg['nombre']}")
+                    os.remove(ruta)
+                    return
+
+            # Llegamos aquí solo con 413: el servidor no acepta partes de este tamaño -> reducir a la mitad
+            nuevo = min(limite, tamano) // 2
+            if nuevo < 5 * 1024 * 1024:
+                await update.message.reply_text(f"❌ {cfg['nombre']} rechaza incluso partes pequeñas (413). No puedo subir este archivo.")
+                os.remove(ruta)
+                return
+            limite = nuevo
+            cfg["max_parte"] = nuevo  # se recuerda para los próximos archivos
+            await update.message.reply_text(f"⚠️ El servidor rechaza ese tamaño (413). Reintentando en partes de {fmt_bytes(nuevo)}...")
     except Exception as e:
         tb = traceback.format_exc()
         log_error(user_id, f"Error procesando enlace: {str(e)}", tb)
