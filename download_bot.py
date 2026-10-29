@@ -42,6 +42,9 @@ ADMIN_IDS = [5293884821]
 # Límites (cambio obligatorio 1 y 2)
 MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024   # 10 GB
 MAX_SPLIT_SIZE = 1024 * 1024 * 1024       # 1 GB (para dividir)
+# Limita trabajos pesados simultáneos; se puede ajustar en Render.
+MAX_CONCURRENT_UPLOADS = max(1, int(os.environ.get("MAX_CONCURRENT_UPLOADS", "1")))
+UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 
 # Cifrado Fernet (cambio obligatorio 1)
 from cryptography.fernet import Fernet
@@ -133,17 +136,35 @@ def limpiar_logs_antiguos(dias=30):
         c.execute("DELETE FROM logs WHERE fecha < ?", (limite,))
         print(f"🧹 Limpiados {c.rowcount} logs antiguos (> {dias} días)")
 
-def limpiar_archivos_temporales_antiguos(horas=1):
+def limpiar_archivos_temporales_antiguos(horas=24):
+    """Limpia temporales viejos, pero conserva durante 24 h los archivos de trabajos fallidos."""
     ahora = time.time()
     os.makedirs("temp_downloads", exist_ok=True)
     for f in os.listdir("temp_downloads"):
         ruta = os.path.join("temp_downloads", f)
-        if os.path.isfile(ruta) and (ahora - os.path.getmtime(ruta)) > horas * 3600:
+        if not os.path.isfile(ruta):
+            continue
+        # Un archivo .failed se conserva hasta 24 h para permitir recuperación manual.
+        edad_limite = 24 if f.endswith(".failed") else horas
+        if (ahora - os.path.getmtime(ruta)) > edad_limite * 3600:
             try:
                 os.remove(ruta)
                 print(f"🧹 Eliminado temporal antiguo: {ruta}")
             except Exception as e:
                 print(f"⚠️ No se pudo eliminar {ruta}: {e}")
+
+def conservar_archivo_fallido(ruta):
+    """Conserva un archivo completo fallido para recuperación manual durante 24 h."""
+    if not ruta or not os.path.isfile(ruta):
+        return None
+    destino = ruta if ruta.endswith(".failed") else ruta + ".failed"
+    try:
+        os.replace(ruta, destino)
+        print(f"⚠️ Archivo conservado para recuperación: {destino}")
+        return destino
+    except OSError as e:
+        print(f"⚠️ No se pudo conservar {ruta}: {e}")
+        return None
 
 def es_admin(telegram_id):
     return telegram_id in ADMIN_IDS
@@ -918,7 +939,9 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prog_dl = Progreso(size)
         titulo_dl = f"📥 Descargando {nombre_base}"
         msg_dl = await update.message.reply_text(texto_progreso(titulo_dl, prog_dl))
-        tamano = await con_progreso(msg_dl, titulo_dl, prog_dl, descargar_archivo(enlace, ruta, prog_dl))
+        ruta_descarga = ruta + ".part"
+        tamano = await con_progreso(msg_dl, titulo_dl, prog_dl, descargar_archivo(enlace, ruta_descarga, prog_dl))
+        os.replace(ruta_descarga, ruta)
         await editar_seguro(msg_dl, f"✅ Descargado: {nombre_base} ({fmt_bytes(tamano)}) 100%")
 
         limite = cfg.get("max_parte") or MAX_SPLIT_SIZE
@@ -926,14 +949,14 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
             demasiado_grande = False  # el servidor respondió 413
             if tamano > limite:
                 if not shutil.which('7z'):
-                    await update.message.reply_text("❌ El VPS no tiene '7z' instalado. No puedo dividir el archivo.")
-                    os.remove(ruta)
+                    await update.message.reply_text("❌ El VPS no tiene '7z' instalado. El archivo se conservará para recuperarlo.")
+                    conservar_archivo_fallido(ruta)
                     return
                 await update.message.reply_text(f"📦 Dividiendo en partes de {fmt_bytes(limite)}...")
                 partes = await dividir_archivo_async(ruta, limite)
                 if not partes:
-                    await update.message.reply_text("❌ Error al dividir el archivo. Ver logs del VPS.")
-                    os.remove(ruta)
+                    await update.message.reply_text("❌ Error al dividir el archivo. El archivo original se conservará para recuperarlo.")
+                    conservar_archivo_fallido(ruta)
                     return
                 enlaces = []
                 for i, parte in enumerate(partes, 1):
@@ -963,7 +986,10 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if os.path.exists(p):
                         os.remove(p)
                 if not demasiado_grande:
-                    os.remove(ruta)
+                    if enlaces:
+                        os.remove(ruta)
+                    else:
+                        conservar_archivo_fallido(ruta)
                     if enlaces:
                         msg = f"📎 <b>{h(nombre_base)}</b> - Partes (únelas con 7-Zip):\n\n" + "\n".join(f"<code>{h(e)}</code>" for e in enlaces)
                         await update.message.reply_text(msg[:4000], parse_mode='HTML')
@@ -989,18 +1015,18 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         await update.message.reply_text(f"❌ Error de {cfg['nombre']}: {str(res.get('error', 'Desconocido'))[:500]}")
                         log_error(user_id, "Error de la nube en subida", res.get('traceback', ''))
-                        os.remove(ruta)
+                        conservar_archivo_fallido(ruta)
                         return
                 else:
-                    await update.message.reply_text(f"❌ Error al subir a {cfg['nombre']}")
-                    os.remove(ruta)
+                    await update.message.reply_text(f"❌ Error al subir a {cfg['nombre']}. El archivo se conservará para recuperarlo.")
+                    conservar_archivo_fallido(ruta)
                     return
 
             # Llegamos aquí solo con 413: el servidor no acepta partes de este tamaño -> reducir a la mitad
             nuevo = min(limite, tamano) // 2
             if nuevo < 5 * 1024 * 1024:
-                await update.message.reply_text(f"❌ {cfg['nombre']} rechaza incluso partes pequeñas (413). No puedo subir este archivo.")
-                os.remove(ruta)
+                await update.message.reply_text(f"❌ {cfg['nombre']} rechaza incluso partes pequeñas (413). El original se conservará para recuperarlo.")
+                conservar_archivo_fallido(ruta)
                 return
             limite = nuevo
             cfg["max_parte"] = nuevo  # se recuerda para los próximos archivos
@@ -1009,11 +1035,20 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tb = traceback.format_exc()
         log_error(user_id, f"Error procesando enlace: {str(e)}", tb)
         await update.message.reply_text(f"❌ Error: {str(e)}"[:1000])  # sin parse_mode
+        # No borrar el archivo descargado cuando falla la subida. Se conserva como
+        # .failed para recuperación durante 24 h en el disco disponible.
         try:
-            if os.path.exists(ruta):
-                os.remove(ruta)
-        except:
-            pass
+            ruta_parcial = ruta + ".part"
+            if os.path.exists(ruta_parcial):
+                os.remove(ruta_parcial)
+            conservar_archivo_fallido(ruta)
+        except Exception as cleanup_error:
+            print(f"⚠️ No se pudo limpiar/conservar el archivo fallido: {cleanup_error}")
+
+async def procesar_enlace_controlado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Limita las subidas simultáneas sin bloquear los comandos del bot."""
+    async with UPLOAD_SEMAPHORE:
+        await procesar_enlace(update, context)
 
 # ==================================================
 # SERVIDOR DE SALUD (Render Web Service necesita un puerto abierto)
@@ -1052,7 +1087,7 @@ def main():
         print("⚠️ ADVERTENCIA: '7z' no está instalado. No podrás dividir archivos >1GB.")
         print("   Instala con: sudo apt install p7zip-full")
     iniciar_servidor_salud()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(4).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setmoodle", set_moodle))
     app.add_handler(CommandHandler("cambiar", cmd_cambiar))
@@ -1064,7 +1099,7 @@ def main():
     app.add_handler(CommandHandler("mystats", mis_estadisticas))
     app.add_handler(CommandHandler("admin", panel_admin))
     app.add_handler(CallbackQueryHandler(admin_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_enlace))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_enlace_controlado))
     print("🤖 Bot iniciado.")
     print("Límite de archivo: 10 GB. Sanitización de nombres activada.")
     app.run_polling()
