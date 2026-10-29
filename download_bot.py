@@ -917,8 +917,15 @@ async def procesar_job(bot, job):
                     if subida_ok(res):
                         nom = os.path.basename(parte)
                         # El enlace de webservice/pluginfile.php usa el contextid y exige el token
+                        print(f"UPLOAD_RESPONSE: {res}")
                         ctx_id = res.get('contextid') or res['userid']
-                        url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/draft/{res['itemid']}/{quote(nom)}"
+                        nom_srv = res.get('filename') or nom
+                        ruta_srv = res.get('filepath') or '/'
+                        if not ruta_srv.startswith('/'):
+                            ruta_srv = '/' + ruta_srv
+                        if not ruta_srv.endswith('/'):
+                            ruta_srv += '/'
+                        url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
                         tok_srv = getattr(sesion, 'moodle_token', None)
                         if tok_srv:
                             url += f"?token={tok_srv}"
