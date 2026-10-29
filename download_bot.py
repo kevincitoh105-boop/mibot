@@ -154,40 +154,134 @@ def create_session():
     s.mount('https://', HTTPAdapter(max_retries=retries))
     return s
 
+# --------------------------------------------------
+# Errores de Moodle: cada tipo de fallo tiene su propia clase y su propio
+# mensaje, para no decir "contraseña incorrecta" cuando Moodle está caído.
+# --------------------------------------------------
+class MoodleError(Exception):
+    """Error al hablar con Moodle. `usuario_msg` es el texto que se muestra en Telegram
+    (sin Markdown); `detalle` es el detalle técnico para los logs."""
+    def __init__(self, usuario_msg, detalle=""):
+        super().__init__(detalle or usuario_msg)
+        self.usuario_msg = usuario_msg
+        self.detalle = detalle or usuario_msg
+
+class MoodleConexionError(MoodleError):
+    """Moodle no responde: caído, rechaza la conexión, timeout, DNS, SSL, error 5xx o bloqueo."""
+
+class MoodleCredencialesError(MoodleError):
+    """Moodle SÍ respondió y rechazó el usuario/contraseña (o la cuenta está bloqueada)."""
+
+class MoodleRespuestaError(MoodleError):
+    """Moodle respondió, pero la página no tiene el formato esperado."""
+
+_SIN_VERIFICAR = "No pude verificar tus credenciales."
+
+def clasificar_error_conexion(e):
+    """Convierte una excepción de `requests` en un MoodleConexionError con un mensaje claro."""
+    texto = str(e)
+    bajo = texto.lower()
+    if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+        code = e.response.status_code
+        if code in (401, 403):
+            msg = (f"⛔ Moodle respondió {code} (acceso denegado). Parece que bloquea al servidor "
+                   f"del bot; no es un problema de tu contraseña. {_SIN_VERIFICAR}")
+        elif code == 404:
+            msg = (f"❓ Moodle respondió 404: no encuentra la página de login. "
+                   f"Puede haber cambiado la dirección. {_SIN_VERIFICAR}")
+        elif code >= 500:
+            msg = (f"🛠️ Moodle devolvió un error {code}: está caído o en mantenimiento. "
+                   f"Intenta de nuevo más tarde. {_SIN_VERIFICAR}")
+        else:
+            msg = f"⚠️ Moodle respondió con HTTP {code}. {_SIN_VERIFICAR}"
+    elif isinstance(e, requests.exceptions.RetryError):
+        msg = (f"🛠️ Moodle respondió con errores 502/503/504 varias veces seguidas: está caído "
+               f"o sobrecargado. Intenta de nuevo más tarde. {_SIN_VERIFICAR}")
+    elif isinstance(e, requests.exceptions.SSLError):
+        msg = f"🔒 Error de certificado SSL al conectar con Moodle. {_SIN_VERIFICAR}"
+    elif isinstance(e, requests.exceptions.Timeout):
+        msg = (f"⏱️ Moodle tardó demasiado en responder (timeout): está muy lento o caído. "
+               f"{_SIN_VERIFICAR}")
+    elif isinstance(e, requests.exceptions.ConnectionError):
+        if "connection refused" in bajo or "errno 111" in bajo:
+            msg = (f"🔌 Moodle rechazó la conexión: está caído o no acepta conexiones desde el "
+                   f"servidor del bot. No es un problema de tu contraseña. {_SIN_VERIFICAR}")
+        elif any(p in bajo for p in ("name or service not known", "nameresolutionerror",
+                                     "temporary failure in name resolution", "getaddrinfo")):
+            msg = (f"🌐 No se pudo resolver la dirección de Moodle (DNS). Puede estar caído. "
+                   f"{_SIN_VERIFICAR}")
+        elif "connection reset" in bajo or "connection aborted" in bajo:
+            msg = f"🔌 Moodle cortó la conexión de golpe. Intenta de nuevo. {_SIN_VERIFICAR}"
+        else:
+            msg = (f"🔌 No pude conectar con Moodle: parece caído o inaccesible. "
+                   f"{_SIN_VERIFICAR}")
+    else:
+        msg = f"⚠️ Error inesperado al contactar a Moodle ({type(e).__name__}). {_SIN_VERIFICAR}"
+    return MoodleConexionError(msg, f"{type(e).__name__}: {texto}")
+
 def login_moodle(usuario, contraseña):
+    """Inicia sesión en Moodle y devuelve la sesión.
+
+    Si falla, lanza una excepción que dice exactamente qué pasó:
+      - MoodleConexionError:    Moodle no responde (las credenciales ni se probaron)
+      - MoodleRespuestaError:   Moodle responde pero la página no es la esperada
+      - MoodleCredencialesError: Moodle respondió y rechazó usuario/contraseña
+    """
     sesion = create_session()
+    login_url = f"{MOODLE_URL}/login/index.php"
+
+    # 1. Pedir la página de login (aquí se nota si Moodle está caído o bloquea)
     try:
-        login_page = sesion.get(f"{MOODLE_URL}/login/index.php", timeout=30)
+        login_page = sesion.get(login_url, timeout=30)
         login_page.raise_for_status()
-    except Exception as e:
-        print(f"Login GET error: {e}\n{traceback.format_exc()}")
-        return None
-    match = re.search(r'name="logintoken" value="([^"]+)"', login_page.text)
+    except requests.exceptions.RequestException as e:
+        print(f"Login GET error: {type(e).__name__}: {e}")
+        raise clasificar_error_conexion(e) from e
+
+    # 2. Sacar el logintoken del formulario
+    match = (re.search(r'name="logintoken"[^>]*value="([^"]+)"', login_page.text)
+             or re.search(r'value="([^"]+)"[^>]*name="logintoken"', login_page.text))
     if not match:
-        print("No se encontró logintoken")
-        return None
-    logintoken = match.group(1)
+        print("No se encontró logintoken en la página de login")
+        raise MoodleRespuestaError(
+            f"⚠️ Moodle respondió, pero la página de login no tiene el formato esperado "
+            f"(¿mantenimiento o la página cambió?). {_SIN_VERIFICAR}",
+            "logintoken no encontrado")
     payload = {
         'username': usuario,
         'password': contraseña,
-        'logintoken': logintoken,
+        'logintoken': match.group(1),
         'anchor': ''
     }
+
+    # 3. Enviar usuario y contraseña
     try:
-        response = sesion.post(f"{MOODLE_URL}/login/index.php", data=payload, allow_redirects=True, timeout=30)
+        response = sesion.post(login_url, data=payload, allow_redirects=True, timeout=30)
         response.raise_for_status()
-    except Exception as e:
-        print(f"Login POST error: {e}\n{traceback.format_exc()}")
-        return None
-    if 'MoodleSession' not in sesion.cookies.get_dict():
-        print("No se encontró cookie MoodleSession")
-        return None
+    except requests.exceptions.RequestException as e:
+        print(f"Login POST error: {type(e).__name__}: {e}")
+        raise clasificar_error_conexion(e) from e
+
+    # 4. Interpretar la respuesta. Si Moodle nos devuelve a la página de login,
+    #    sí respondió y rechazó el usuario/contraseña.
     if '/login/index.php' in response.url:
-        print("Redirigido a login")
-        return None
-    if 'loginerrors' in response.text.lower() or 'invalid login' in response.text.lower():
-        print("Login fallido por mensaje de error")
-        return None
+        texto = response.text.lower()
+        print("Moodle devolvió la página de login: credenciales rechazadas")
+        if re.search(r'(account[^<]{0,40}locked|cuenta[^<]{0,40}bloquead)', texto):
+            raise MoodleCredencialesError(
+                "🔒 Moodle dice que tu cuenta está bloqueada (probablemente por demasiados "
+                "intentos fallidos). Espera un rato o contacta al administrador de Moodle.",
+                "cuenta bloqueada")
+        raise MoodleCredencialesError(
+            "🔑 Moodle respondió y rechazó el usuario o la contraseña. Revisa mayúsculas, "
+            "espacios y que sean los de Moodle. Usa /setmoodle usuario contraseña.",
+            "credenciales rechazadas")
+    if not any(k.startswith('MoodleSession') for k in sesion.cookies.get_dict()):
+        print("No se encontró cookie MoodleSession")
+        raise MoodleRespuestaError(
+            f"⚠️ Moodle respondió, pero no abrió una sesión (sin cookie de sesión). "
+            f"{_SIN_VERIFICAR}",
+            "sin cookie MoodleSession")
     return sesion
 
 def subir_a_moodle(sesion, ruta_archivo):
@@ -325,13 +419,14 @@ async def set_moodle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usuario, contraseña = context.args[0], context.args[1]
     await update.message.reply_text("🔐 Probando conexión...", parse_mode='Markdown')
     try:
-        sesion = login_moodle(usuario, contraseña)
-        if sesion:
-            guardar_credenciales_moodle(user_id, usuario, contraseña)
-            await update.message.reply_text(f"✅ Credenciales guardadas para: `{escape_markdown(usuario)}`", parse_mode='Markdown')
-            log_action(user_id, "set_moodle", usuario)
-        else:
-            await update.message.reply_text("❌ Error: No pude iniciar sesión. Verifica usuario/contraseña", parse_mode='Markdown')
+        # En un hilo aparte para no bloquear al bot mientras Moodle responde
+        await asyncio.to_thread(login_moodle, usuario, contraseña)
+        guardar_credenciales_moodle(user_id, usuario, contraseña)
+        await update.message.reply_text(f"✅ Credenciales guardadas para: `{escape_markdown(usuario)}`", parse_mode='Markdown')
+        log_action(user_id, "set_moodle", usuario)
+    except MoodleError as e:
+        log_action(user_id, "login_error", f"{type(e).__name__}: {e.detalle}"[:300])
+        await update.message.reply_text(e.usuario_msg)
     except Exception as e:
         log_error(user_id, "Error en set_moodle", traceback.format_exc())
         await update.message.reply_text("❌ Error interno.")
@@ -571,6 +666,20 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {str(e)}", parse_mode='Markdown')
         return
 
+    # 3. Login ANTES de descargar: si Moodle está caído o las credenciales están mal,
+    #    fallamos ya, sin gastar tiempo ni disco descargando el archivo.
+    try:
+        await update.message.reply_text("🔐 Iniciando sesión en Moodle...", parse_mode='Markdown')
+        sesion = await asyncio.to_thread(login_moodle, usuario, contraseña)
+    except MoodleError as e:
+        log_action(user_id, "login_error", f"{type(e).__name__}: {e.detalle}"[:300])
+        await update.message.reply_text(e.usuario_msg)
+        return
+    except Exception as e:
+        log_error(user_id, f"Error inesperado en login: {str(e)}", traceback.format_exc())
+        await update.message.reply_text("❌ Error interno al iniciar sesión en Moodle.")
+        return
+
     # Nombre único para evitar colisiones
     nombre_archivo = f"{user_id}_{int(time.time())}_{nombre_base}"
     ruta = os.path.join("temp_downloads", nombre_archivo)
@@ -579,14 +688,6 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tamano = await descargar_archivo(enlace, ruta)
         await update.message.reply_text(f"✅ Descargado: `{escape_markdown(nombre_base)}` ({tamano/(1024**2):.1f} MB)", parse_mode='Markdown')
-
-        # Login
-        await update.message.reply_text("🔐 Iniciando sesión en Moodle...", parse_mode='Markdown')
-        sesion = login_moodle(usuario, contraseña)
-        if not sesion:
-            await update.message.reply_text("❌ Error de login. Verifica /setmoodle", parse_mode='Markdown')
-            os.remove(ruta)
-            return
 
         # Dividir si excede 1GB
         if tamano > MAX_SPLIT_SIZE:
@@ -655,7 +756,6 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(ruta)
         except:
             pass
-
 # ==================================================
 # SERVIDOR DE SALUD (Render Web Service necesita un puerto abierto)
 # ==================================================
@@ -710,3 +810,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
