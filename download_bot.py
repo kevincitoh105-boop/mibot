@@ -153,6 +153,19 @@ def limpiar_archivos_temporales_antiguos(horas=24):
             except Exception as e:
                 print(f"⚠️ No se pudo eliminar {ruta}: {e}")
 
+def conservar_archivo_fallido(ruta):
+    """Conserva un archivo completo fallido para recuperación manual durante 24 h."""
+    if not ruta or not os.path.isfile(ruta):
+        return None
+    destino = ruta if ruta.endswith(".failed") else ruta + ".failed"
+    try:
+        os.replace(ruta, destino)
+        print(f"⚠️ Archivo conservado para recuperación: {destino}")
+        return destino
+    except OSError as e:
+        print(f"⚠️ No se pudo conservar {ruta}: {e}")
+        return None
+
 def es_admin(telegram_id):
     return telegram_id in ADMIN_IDS
 
@@ -934,14 +947,14 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
             demasiado_grande = False  # el servidor respondió 413
             if tamano > limite:
                 if not shutil.which('7z'):
-                    await update.message.reply_text("❌ El VPS no tiene '7z' instalado. No puedo dividir el archivo.")
-                    os.remove(ruta)
+                    await update.message.reply_text("❌ El VPS no tiene '7z' instalado. El archivo se conservará para recuperarlo.")
+                    conservar_archivo_fallido(ruta)
                     return
                 await update.message.reply_text(f"📦 Dividiendo en partes de {fmt_bytes(limite)}...")
                 partes = await dividir_archivo_async(ruta, limite)
                 if not partes:
-                    await update.message.reply_text("❌ Error al dividir el archivo. Ver logs del VPS.")
-                    os.remove(ruta)
+                    await update.message.reply_text("❌ Error al dividir el archivo. El archivo original se conservará para recuperarlo.")
+                    conservar_archivo_fallido(ruta)
                     return
                 enlaces = []
                 for i, parte in enumerate(partes, 1):
@@ -971,7 +984,10 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if os.path.exists(p):
                         os.remove(p)
                 if not demasiado_grande:
-                    os.remove(ruta)
+                    if enlaces:
+                        os.remove(ruta)
+                    else:
+                        conservar_archivo_fallido(ruta)
                     if enlaces:
                         msg = f"📎 <b>{h(nombre_base)}</b> - Partes (únelas con 7-Zip):\n\n" + "\n".join(f"<code>{h(e)}</code>" for e in enlaces)
                         await update.message.reply_text(msg[:4000], parse_mode='HTML')
@@ -997,18 +1013,18 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         await update.message.reply_text(f"❌ Error de {cfg['nombre']}: {str(res.get('error', 'Desconocido'))[:500]}")
                         log_error(user_id, "Error de la nube en subida", res.get('traceback', ''))
-                        os.remove(ruta)
+                        conservar_archivo_fallido(ruta)
                         return
                 else:
-                    await update.message.reply_text(f"❌ Error al subir a {cfg['nombre']}")
-                    os.remove(ruta)
+                    await update.message.reply_text(f"❌ Error al subir a {cfg['nombre']}. El archivo se conservará para recuperarlo.")
+                    conservar_archivo_fallido(ruta)
                     return
 
             # Llegamos aquí solo con 413: el servidor no acepta partes de este tamaño -> reducir a la mitad
             nuevo = min(limite, tamano) // 2
             if nuevo < 5 * 1024 * 1024:
-                await update.message.reply_text(f"❌ {cfg['nombre']} rechaza incluso partes pequeñas (413). No puedo subir este archivo.")
-                os.remove(ruta)
+                await update.message.reply_text(f"❌ {cfg['nombre']} rechaza incluso partes pequeñas (413). El original se conservará para recuperarlo.")
+                conservar_archivo_fallido(ruta)
                 return
             limite = nuevo
             cfg["max_parte"] = nuevo  # se recuerda para los próximos archivos
