@@ -461,6 +461,21 @@ class _CuerpoMultipart:
     def close(self):
         self.f.close()
 
+def _mover_a_privados(sesion, base_url, token, draftid):
+    # Pasa el borrador a 'Archivos privados' (descargable con token). Devuelve None si va bien.
+    try:
+        r = sesion.post(f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/rest/server.php",
+                        data={'wstoken': token, 'wsfunction': 'core_user_add_user_private_files',
+                              'moodlewsrestformat': 'json', 'draftid': draftid}, timeout=120)
+        r.raise_for_status()
+        datos = r.json() if r.text.strip() else None
+        print(f"MOVER_PRIVADOS respuesta: {str(datos)[:300]}")
+        if isinstance(datos, dict) and (datos.get('exception') or datos.get('errorcode')):
+            return f"Moodle no pudo guardar en Archivos privados: {datos.get('message') or datos.get('errorcode')}"
+        return None
+    except Exception as e:
+        return f"No se pudo mover a Archivos privados: {type(e).__name__}: {e}"
+
 def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
     url_subida = f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/upload.php"
     token = getattr(sesion, 'moodle_token', None)
@@ -471,7 +486,7 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
     cuerpo = _CuerpoMultipart(ruta_archivo, 'file_1', progreso)
     try:
         respuesta = sesion.post(url_subida,
-                                params={'token': token, 'filearea': MOODLE_FILEAREA}, data=cuerpo,
+                                params={'token': token}, data=cuerpo,
                                 headers={'Content-Type': f'multipart/form-data; boundary={cuerpo.boundary}'},
                                 timeout=(30, 900))
         respuesta.raise_for_status()
@@ -492,7 +507,13 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
         if isinstance(datos, dict) and 'error' in datos:
             return datos
         if isinstance(datos, list) and len(datos) > 0:
-            return datos[0]
+            info = datos[0]
+            if MOODLE_FILEAREA == 'private' and isinstance(info, dict) and info.get('filearea') == 'draft':
+                fallo = _mover_a_privados(sesion, base_url, token, info['itemid'])
+                if fallo:
+                    return {"error": fallo, "reintentable": False}
+                info['filearea'] = 'private'
+            return info
         return None
     except Exception as e:
         return {"error": f"JSON decode: {e}", "traceback": traceback.format_exc()}
