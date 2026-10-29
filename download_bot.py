@@ -916,7 +916,12 @@ async def procesar_job(bot, job):
                             pass
                     if subida_ok(res):
                         nom = os.path.basename(parte)
-                        url = f"{base_url}/webservice/pluginfile.php/{res['userid']}/user/draft/{res['itemid']}/{quote(nom)}"
+                        # El enlace de webservice/pluginfile.php usa el contextid y exige el token
+                        ctx_id = res.get('contextid') or res['userid']
+                        url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/draft/{res['itemid']}/{quote(nom)}"
+                        tok_srv = getattr(sesion, 'moodle_token', None)
+                        if tok_srv:
+                            url += f"?token={tok_srv}"
                         enlaces.append(url)
                         filas.append((uid, f"{nombre_base}.part{i}" if dividir else nombre_base, nom,
                                       res['itemid'], res['userid'], url,
