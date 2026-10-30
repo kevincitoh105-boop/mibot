@@ -46,6 +46,9 @@ CLOUDS = {
         # EVA responde 413 con archivos grandes: se sube en partes de este tamaño
         # (si aún da 413 el bot lo reduce solo). Ajustable con EVA_MAX_PART_MB.
         "max_parte": int(os.environ.get("EVA_MAX_PART_MB", "50")) * 1024 * 1024},
+    3: {"nombre": "Joven Club CursaD",
+        "url": os.environ.get("CURSAD_URL", "https://cursad.jovenclub.cu").rstrip("/"),
+        "requiere_cuenta": True},
 }
 NUBE_POR_DEFECTO = 1
 ADMIN_IDS = [5293884821]
