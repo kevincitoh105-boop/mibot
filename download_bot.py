@@ -33,22 +33,27 @@ if not BOT_TOKEN:
     raise ValueError("No se encontró BOT_TOKEN en variables de entorno.")
 
 MOODLE_URL = "https://moodle.instec.cu"
-# 'private' = Archivos privados del usuario (descargables con token); 'draft' = borrador temporal
+# 'draft'   = borrador: el enlace es draftfile.php y se abre con la sesión de Moodle iniciada (sin token).
+# 'private' = Archivos privados del usuario (descargable con token).
+# Cada nube tiene la suya (ver CLOUDS). MOODLE_FILEAREA vale para Moodle INSTEC y EVA_FILEAREA para EVA.
 MOODLE_FILEAREA = os.environ.get("MOODLE_FILEAREA", "draft")
 
 # ==================================================
 # NUBES DISPONIBLES (/cambiar). Para añadir otra: una entrada nueva aquí.
 # ==================================================
 CLOUDS = {
-    1: {"nombre": "Moodle INSTEC", "url": MOODLE_URL, "requiere_cuenta": True},
+    1: {"nombre": "Moodle INSTEC", "url": MOODLE_URL, "requiere_cuenta": True,
+        "filearea": MOODLE_FILEAREA},
     2: {"nombre": "EVA Desoft", "url": os.environ.get("EVA_URL", "https://eva.desoft.cu").rstrip("/"),
         "requiere_cuenta": True,
+        # EVA también es Moodle: usa el mismo enlace draftfile.php que Moodle INSTEC.
+        "filearea": os.environ.get("EVA_FILEAREA", "draft"),
         # EVA responde 413 con archivos grandes: se sube en partes de este tamaño
         # (si aún da 413 el bot lo reduce solo). Ajustable con EVA_MAX_PART_MB.
         "max_parte": int(os.environ.get("EVA_MAX_PART_MB", "50")) * 1024 * 1024},
-    3: {"nombre": "Joven Club CursaD",
-        "url": os.environ.get("CURSAD_URL", "https://cursad.jovenclub.cu").rstrip("/"),
-        "requiere_cuenta": True},
+    3: {"nombre": "Cursad JovenClub", "url": os.environ.get("CURSAD_URL", "https://cursad.jovenclub.cu").rstrip("/"),
+        "requiere_cuenta": True,
+        "filearea": os.environ.get("CURSAD_FILEAREA", "draft")},
 }
 NUBE_POR_DEFECTO = 1
 ADMIN_IDS = [5293884821]
@@ -160,6 +165,16 @@ def init_db():
                       PRIMARY KEY (telegram_id, nube))''')
         c.execute('''CREATE TABLE IF NOT EXISTS preferencias
                      (telegram_id INTEGER PRIMARY KEY, nube INTEGER)''')
+        # Trabajos activos (en cola o en curso). Al cancelar, terminar o reiniciar el bot, se borran.
+        c.execute('''CREATE TABLE IF NOT EXISTS trabajos
+                     (ref TEXT PRIMARY KEY, job_id INTEGER, telegram_id INTEGER, nombre TEXT,
+                      url TEXT, nube INTEGER, fecha TIMESTAMP)''')
+        c.execute("DELETE FROM trabajos")  # ningún trabajo sobrevive a un reinicio
+        # Migración: cada archivo guardado recuerda de qué trabajo salió (para borrarlo si se cancela)
+        try:
+            c.execute("ALTER TABLE archivos ADD COLUMN job_ref TEXT")
+        except sqlite3.OperationalError:
+            pass  # la columna ya existe
         # Migración: las credenciales Moodle que ya tenías pasan a la nube 1
         c.execute('''INSERT OR IGNORE INTO credenciales_nube (telegram_id, nube, usuario, contraseña)
                      SELECT telegram_id, 1, usuario, contraseña FROM credenciales_moodle''')
@@ -500,7 +515,7 @@ def _diagnostico_privados(sesion, base_url, token, ctx_id, nombre):
     except Exception as e:
         print(f"DIAG_GET error: {type(e).__name__}: {e}")
 
-def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
+def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None, filearea="draft"):
     url_subida = f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/upload.php"
     token = getattr(sesion, 'moodle_token', None)
     if not token:
@@ -532,7 +547,7 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
             return datos
         if isinstance(datos, list) and len(datos) > 0:
             info = datos[0]
-            if MOODLE_FILEAREA == 'private' and isinstance(info, dict) and info.get('filearea') == 'draft':
+            if filearea == 'private' and isinstance(info, dict) and info.get('filearea') == 'draft':
                 fallo = _mover_a_privados(sesion, base_url, token, info['itemid'])
                 if fallo:
                     return {"error": fallo, "reintentable": False}
@@ -544,11 +559,65 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None):
     except Exception as e:
         return {"error": f"JSON decode: {e}", "traceback": traceback.format_exc()}
 
+def construir_enlace(base_url, filearea, res, nombre_defecto, token=None):
+    """Arma el enlace de un archivo recién subido (igual para Moodle INSTEC y EVA Desoft).
+    - 'draft'  : draftfile.php, se abre con la sesión de Moodle iniciada (sin token).
+    - 'private': webservice/pluginfile.php con token."""
+    ctx_id = res.get('contextid') or res['userid']
+    nom_srv = res.get('filename') or nombre_defecto
+    ruta_srv = res.get('filepath') or '/'
+    if not ruta_srv.startswith('/'):
+        ruta_srv = '/' + ruta_srv
+    if not ruta_srv.endswith('/'):
+        ruta_srv += '/'
+    if filearea == 'private':
+        url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/private{quote(ruta_srv)}{quote(nom_srv)}"
+        if token:
+            url += f"?token={token}"
+        return url
+    return f"{base_url}/draftfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
+
+def _dividir_python(ruta_archivo, tamano_bytes):
+    """Respaldo sin 7z: parte el archivo en trozos binarios nombre.001, nombre.002...
+    (se unen con 7-Zip/HJSplit o 'copy /b' en Windows). Devuelve la lista de partes o []."""
+    directorio = os.path.dirname(os.path.abspath(ruta_archivo))
+    base = os.path.basename(ruta_archivo)
+    partes = []
+    try:
+        with open(ruta_archivo, "rb") as src:
+            i = 1
+            while True:
+                destino = os.path.join(directorio, f"{base}.{i:03d}")
+                restante = int(tamano_bytes)
+                escrito = 0
+                with open(destino, "wb") as dst:
+                    while restante > 0:
+                        bloque = src.read(min(4 * 1024 * 1024, restante))
+                        if not bloque:
+                            break
+                        dst.write(bloque)
+                        restante -= len(bloque)
+                        escrito += len(bloque)
+                if escrito == 0:
+                    os.remove(destino)
+                    break
+                partes.append(destino)
+                i += 1
+    except Exception as e:
+        print(f"split python error: {e}\n{traceback.format_exc()}")
+        for f in partes:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return []
+    return partes
+
 def dividir_archivo(ruta_archivo, tamano_bytes=1024 * 1024 * 1024):
     """Divide con 7z en modo 'store' (-mx=0, sin comprimir: mucho más rápido y los archivos
     suelen venir ya comprimidos). Devuelve la lista de partes o [] si falla."""
     if not shutil.which('7z'):
-        return []
+        return _dividir_python(ruta_archivo, tamano_bytes)
     directorio = os.path.dirname(os.path.abspath(ruta_archivo))
     base = os.path.basename(ruta_archivo)
     archivo_7z = base + ".7z"
@@ -628,6 +697,10 @@ def texto_progreso(titulo, prog):
                 f"⚡ {fmt_bytes(vel)}/s · ⏳ {fmt_tiempo(eta)}")
     return f"{titulo}\n{fmt_bytes(prog.hecho)} · ⚡ {fmt_bytes(vel)}/s"
 
+def teclado_cancelar(ref):
+    """Botón 'Cancelar' que se muestra debajo de los mensajes de cada subida/descarga."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Cancelar", callback_data=f"cancel_{ref}")]])
+
 async def decir(bot, chat_id, texto, **kw):
     """Envía un mensaje sin romper el trabajo si Telegram falla. Devuelve el mensaje o None."""
     try:
@@ -637,6 +710,7 @@ async def decir(bot, chat_id, texto, **kw):
         return None
 
 async def editar_seguro(msg, texto, **kw):
+    """Edita un mensaje. Si no se pasa reply_markup, el botón de cancelar desaparece."""
     if msg is None:
         return
     try:
@@ -644,23 +718,25 @@ async def editar_seguro(msg, texto, **kw):
     except Exception:
         pass
 
-async def _bucle_progreso(msg, titulo, prog, intervalo=3):
+async def _bucle_progreso(msg, titulo, prog, intervalo=3, markup=None):
     ultimo = ""
-    while True:
+    while not prog.cancelar.is_set():
         await asyncio.sleep(intervalo)
+        if prog.cancelar.is_set():  # si se canceló, no volver a pintar el progreso ni el botón
+            break
         texto = texto_progreso(titulo, prog)
         if texto != ultimo:
             try:
-                await msg.edit_text(texto)
+                await msg.edit_text(texto, reply_markup=markup)
                 ultimo = texto
             except Exception:
                 pass
 
-async def con_progreso(msg, titulo, prog, trabajo):
+async def con_progreso(msg, titulo, prog, trabajo, markup=None):
     """Ejecuta `trabajo` (corrutina) mientras actualiza `msg` cada pocos segundos."""
     if msg is None:
         return await trabajo
-    tarea = asyncio.create_task(_bucle_progreso(msg, titulo, prog))
+    tarea = asyncio.create_task(_bucle_progreso(msg, titulo, prog, 3, markup))
     try:
         return await trabajo
     finally:
@@ -725,9 +801,9 @@ async def descargar_archivo(url, destino, prog):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _descargar_sync, url, destino, prog)
 
-async def subir_archivo_a_moodle(sesion, ruta, base_url=None, prog=None):
+async def subir_archivo_a_moodle(sesion, ruta, base_url=None, prog=None, filearea="draft"):
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url, prog)
+    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url, prog, filearea)
 
 async def dividir_archivo_async(ruta, tamano_bytes=1024 * 1024 * 1024):
     loop = asyncio.get_running_loop()
@@ -749,6 +825,9 @@ class Job:
     motivo: str = "usuario"            # por qué se canceló: "usuario" | "timeout"
     cancelar: threading.Event = field(default_factory=threading.Event)
     dir: str = ""
+    ref: str = field(default_factory=lambda: uuid.uuid4().hex[:12])  # identificador único (BD y botones)
+    fue_cancelado: bool = False        # True si se canceló (usuario o timeout): hay que borrar sus registros
+    msg_actual: object = None          # último mensaje con progreso (para limpiarlo al cancelar)
 
     def comprobar(self):
         if self.cancelar.is_set():
@@ -761,6 +840,7 @@ class ColaUsuario:
         self.tarea = None
 
 COLAS = {}                       # user_id -> ColaUsuario
+JOBS = {}                        # ref -> Job (todos los trabajos vivos: en cola o en curso)
 _CONTADOR_JOBS = itertools.count(1)
 _SEM = None
 
@@ -770,6 +850,49 @@ def semaforo():
     if _SEM is None:
         _SEM = asyncio.Semaphore(MAX_SUBIDAS_SIMULTANEAS)
     return _SEM
+
+# --- Registro de trabajos en la base de datos y cancelación ---
+def registrar_job(job):
+    try:
+        with get_db_conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO trabajos (ref, job_id, telegram_id, nombre, url, nube, fecha) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (job.ref, job.id, job.user_id, job.nombre_base, job.url, job.nube, ahora()))
+    except Exception as e:
+        print(f"⚠️ No se pudo registrar el trabajo {job.ref}: {e}")
+
+def borrar_registros_job(job):
+    """Borra de la BD el trabajo activo y, si fue cancelado, también cualquier archivo registrado de él."""
+    try:
+        with get_db_conn() as conn:
+            conn.execute("DELETE FROM trabajos WHERE ref = ?", (job.ref,))
+            if job.fue_cancelado:
+                conn.execute("DELETE FROM archivos WHERE job_ref = ? AND telegram_id = ?",
+                             (job.ref, job.user_id))
+    except Exception as e:
+        print(f"⚠️ No se pudieron borrar los registros del trabajo {job.ref}: {e}")
+
+def finalizar_job(job):
+    """Se llama siempre que un trabajo termina (bien, mal o cancelado)."""
+    JOBS.pop(job.ref, None)
+    borrar_registros_job(job)
+
+def cancelar_job(job, motivo="usuario"):
+    """Cancela un trabajo (descarga, división o subida): avisa a los hilos, lo saca de la cola
+    y borra sus registros de la base de datos.
+    Devuelve True si estaba esperando en cola (nunca llegó a empezar)."""
+    job.fue_cancelado = True
+    job.motivo = motivo
+    job.cancelar.set()
+    en_espera = False
+    cola = COLAS.get(job.user_id)
+    if cola is not None and job in cola.pendientes:
+        cola.pendientes.remove(job)
+        en_espera = True
+    if en_espera:
+        JOBS.pop(job.ref, None)   # si estaba en curso, lo limpia finalizar_job() al terminar
+    borrar_registros_job(job)
+    return en_espera
 
 def encolar(bot, job):
     """Devuelve ("ok", posicion) | ("dup", 0) | ("llena", 0). posicion 0 = empieza ya."""
@@ -782,6 +905,8 @@ def encolar(bot, job):
     if len(existentes) >= MAX_COLA_POR_USUARIO:
         return "llena", 0
     cola.pendientes.append(job)
+    JOBS[job.ref] = job
+    registrar_job(job)
     if cola.tarea is None or cola.tarea.done():
         cola.tarea = asyncio.create_task(_worker_usuario(bot, job.user_id, cola))
     return "ok", len(existentes)
@@ -792,6 +917,7 @@ async def _worker_usuario(bot, user_id, cola):
         while cola.pendientes:
             job = cola.pendientes.popleft()
             if job.cancelar.is_set():
+                finalizar_job(job)
                 continue
             cola.actual = job
             try:
@@ -803,6 +929,7 @@ async def _worker_usuario(bot, user_id, cola):
                 await decir(bot, job.chat_id, f"❌ Error interno procesando {job.nombre_base}.")
             finally:
                 cola.actual = None
+                finalizar_job(job)
     finally:
         # sin awaits entre el while y esto: no hay carrera con encolar()
         if COLAS.get(user_id) is cola and not cola.pendientes and cola.actual is None:
@@ -813,13 +940,16 @@ async def _ejecutar_con_limite(bot, job):
     if sem.locked():
         await decir(bot, job.chat_id,
                     f"⏳ {job.nombre_base}: hay {MAX_SUBIDAS_SIMULTANEAS} subidas en curso de otros "
-                    f"usuarios. Empezará en cuanto haya un hueco.")
+                    f"usuarios. Empezará en cuanto haya un hueco.",
+                    reply_markup=teclado_cancelar(job.ref))
     async with sem:
         if job.cancelar.is_set():
+            await decir(bot, job.chat_id, f"🚫 {job.nombre_base}: cancelado antes de empezar.")
             return
         # Tiempo máximo del trabajo: se avisa a los hilos con el Event (cancelación limpia)
         def _timeout():
             job.motivo = "timeout"
+            job.fue_cancelado = True
             job.cancelar.set()
         timer = asyncio.get_running_loop().call_later(JOB_TIMEOUT, _timeout)
         try:
@@ -847,7 +977,9 @@ async def procesar_job(bot, job):
     uid = job.user_id
     cfg = CLOUDS[job.nube]
     base_url = cfg["url"]
+    filearea = cfg.get("filearea", "draft")
     nombre_base = job.nombre_base
+    kb = teclado_cancelar(job.ref)
 
     async def say(texto, **kw):
         return await decir(bot, job.chat_id, texto, **kw)
@@ -878,22 +1010,27 @@ async def procesar_job(bot, job):
     try:
         # 1. Login ANTES de descargar (si la nube está caída o las credenciales mal, fallamos ya)
         job.estado = "iniciando sesión"
-        await say(f"🔐 {nombre_base}: iniciando sesión en {cfg['nombre']}...")
+        msg_login = await say(f"🔐 {nombre_base}: iniciando sesión en {cfg['nombre']}...", reply_markup=kb)
+        job.msg_actual = msg_login
         try:
             sesion = await asyncio.to_thread(login_moodle, usuario, contraseña, base_url)
         except MoodleError as e:
             log_action(uid, "login_error", f"{type(e).__name__}: {e.detalle}"[:300])
+            await editar_seguro(msg_login, f"❌ {nombre_base}: no se pudo iniciar sesión")
             await say(e.usuario_msg)
             return
+        await editar_seguro(msg_login, f"🔐 Sesión iniciada en {cfg['nombre']}")
         job.comprobar()
 
         # 2. Descarga con progreso, reanudación y escritura atómica
         job.estado = "descargando"
         prog_dl = Progreso(job.size, job.cancelar)
         titulo_dl = f"📥 Descargando {nombre_base}"
-        msg_dl = await say(texto_progreso(titulo_dl, prog_dl))
+        msg_dl = await say(texto_progreso(titulo_dl, prog_dl), reply_markup=kb)
+        job.msg_actual = msg_dl
         try:
-            tamano = await con_progreso(msg_dl, titulo_dl, prog_dl, descargar_archivo(job.url, ruta, prog_dl))
+            tamano = await con_progreso(msg_dl, titulo_dl, prog_dl,
+                                        descargar_archivo(job.url, ruta, prog_dl), kb)
         except JobCancelado:
             raise
         except Exception as e:
@@ -912,9 +1049,10 @@ async def procesar_job(bot, job):
                 job.comprobar()
                 prog = Progreso(os.path.getsize(ruta_local), job.cancelar)
                 titulo = f"☁️ Subiendo {etiqueta} a {cfg['nombre']}"
-                msg = await say(texto_progreso(titulo, prog))
+                msg = await say(texto_progreso(titulo, prog), reply_markup=kb)
+                job.msg_actual = msg
                 res = await con_progreso(msg, titulo, prog,
-                                         subir_archivo_a_moodle(sesion, ruta_local, base_url, prog))
+                                         subir_archivo_a_moodle(sesion, ruta_local, base_url, prog, filearea), kb)
                 if subida_ok(res):
                     await editar_seguro(msg, f"✅ {etiqueta} subido (100%)")
                     return res
@@ -935,18 +1073,19 @@ async def procesar_job(bot, job):
             job.comprobar()
             dividir = tamano > limite
             if dividir:
-                if not shutil.which('7z'):
-                    await say("❌ El servidor no tiene '7z' instalado. No puedo dividir el archivo.")
-                    return
                 if shutil.disk_usage(job.dir).free < tamano + MARGEN_DISCO:
                     await say("❌ No hay espacio en disco para dividir el archivo.")
                     return
                 job.estado = "dividiendo"
-                await say(f"📦 Dividiendo {nombre_base} en partes de {fmt_bytes(limite)}...")
+                msg_div = await say(f"📦 Dividiendo {nombre_base} en partes de {fmt_bytes(limite)}...",
+                                    reply_markup=kb)
+                job.msg_actual = msg_div
                 partes = await dividir_archivo_async(ruta, limite)
                 if not partes:
+                    await editar_seguro(msg_div, f"❌ Error al dividir {nombre_base}")
                     await say("❌ Error al dividir el archivo. Ver logs del servidor.")
                     return
+                await editar_seguro(msg_div, f"📦 {nombre_base}: dividido en {len(partes)} partes")
             else:
                 partes = [ruta]
 
@@ -966,28 +1105,15 @@ async def procesar_job(bot, job):
                             pass
                     if subida_ok(res):
                         nom = os.path.basename(parte)
-                        # El enlace de webservice/pluginfile.php usa el contextid y exige el token
                         print(f"UPLOAD_RESPONSE: {res}")
-                        ctx_id = res.get('contextid') or res['userid']
-                        nom_srv = res.get('filename') or nom
-                        ruta_srv = res.get('filepath') or '/'
-                        if not ruta_srv.startswith('/'):
-                            ruta_srv = '/' + ruta_srv
-                        if not ruta_srv.endswith('/'):
-                            ruta_srv += '/'
-                        if MOODLE_FILEAREA == 'private':
-                            url = f"{base_url}/webservice/pluginfile.php/{ctx_id}/user/private{quote(ruta_srv)}{quote(nom_srv)}"
-                        else:
-                            # Borrador: se abre con la sesion de Moodle iniciada (draftfile.php), sin token
-                            url = f"{base_url}/draftfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
-                        tok_srv = getattr(sesion, 'moodle_token', None)
-                        if tok_srv and MOODLE_FILEAREA == 'private':
-                            url += f"?token={tok_srv}"
+                        # Moodle INSTEC y EVA usan el mismo formato de enlace (ver construir_enlace)
+                        url = construir_enlace(base_url, filearea, res, nom,
+                                               getattr(sesion, 'moodle_token', None))
                         enlaces.append(url)
                         filas.append((uid, f"{nombre_base}.part{i}" if dividir else nombre_base, nom,
                                       res['itemid'], res['userid'], url,
                                       os.path.getsize(parte) if os.path.exists(parte) else (tamano if not dividir else 0),
-                                      ahora()))
+                                      ahora(), job.ref))
                     elif _es_413(res):
                         resultado = "413"
                         break
@@ -1009,11 +1135,12 @@ async def procesar_job(bot, job):
                                 pass
 
             if resultado == "ok":
+                job.comprobar()  # si se canceló justo ahora, NO se registra nada en la BD
                 # TODO O NADA: los registros se guardan solo si TODAS las partes subieron
                 with get_db_conn() as conn:
                     conn.executemany('''INSERT INTO archivos (telegram_id, nombre_original, nombre_en_moodle,
-                                        itemid, userid, enlace, tamano_bytes, fecha_subida)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', filas)
+                                        itemid, userid, enlace, tamano_bytes, fecha_subida, job_ref)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', filas)
                 log_action(uid, "subida", f"{nombre_base} ({tamano/(1024**2):.1f}MB, {n} parte(s))")
                 if dividir:
                     await enviar_lista_html(say, f"📎 <b>{h(nombre_base)}</b> - Partes (únelas con 7-Zip):\n\n",
@@ -1040,10 +1167,12 @@ async def procesar_job(bot, job):
             await say(f"⚠️ El servidor rechaza ese tamaño (413). Reintentando en partes de {fmt_bytes(nuevo)}...")
 
     except JobCancelado:
+        job.fue_cancelado = True  # sus registros se borran de la BD al terminar (finalizar_job)
+        await editar_seguro(job.msg_actual, f"🚫 {nombre_base}: cancelado")
         if job.motivo == "timeout":
-            await say(f"⏱️ {nombre_base}: se superó el tiempo máximo ({fmt_tiempo(JOB_TIMEOUT)}). Trabajo abortado y archivos temporales borrados.")
+            await say(f"⏱️ {nombre_base}: se superó el tiempo máximo ({fmt_tiempo(JOB_TIMEOUT)}). Trabajo abortado, archivos temporales y registros borrados.")
         else:
-            await say(f"🚫 {nombre_base}: cancelado. Archivos temporales borrados.")
+            await say(f"🚫 {nombre_base}: cancelado. Archivos temporales y registros borrados.")
         log_action(uid, "cancelado", f"{nombre_base} ({job.motivo})")
     except asyncio.CancelledError:
         # el bot se está apagando: los hilos se detienen con el Event y la carpeta se borra abajo
@@ -1091,6 +1220,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/setmoodle - Guardar cuenta de la nube activa\n"
             f"/cambiar - Cambiar de nube\n\n"
             f"💬 Envíame uno o varios *ENLACES*: se suben de uno en uno, en orden\n"
+            f"🚫 Cada descarga y subida trae un botón *Cancelar*\n"
             f"_Máximo 10 GB por archivo_",
             parse_mode='Markdown'
         )
@@ -1139,11 +1269,38 @@ async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         targets = todos
     for j in targets:
-        j.cancelar.set()
-        if j in cola.pendientes:
-            cola.pendientes.remove(j)
-    await update.message.reply_text(f"🚫 Cancelando {len(targets)} subida(s)...")
+        cancelar_job(j)   # detiene descarga/subida, lo saca de la cola y borra sus registros de la BD
+    await update.message.reply_text(
+        f"🚫 Cancelando {len(targets)} subida(s)... Se detienen en unos segundos y sus registros se borran de la base de datos.")
     log_action(update.effective_user.id, "cancelar", ",".join(f"#{j.id}" for j in targets))
+
+async def cb_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Botón '🚫 Cancelar' de los mensajes de subida/descarga."""
+    query = update.callback_query
+    uid = query.from_user.id
+    ref = (query.data or "").split("_", 1)[-1]
+    job = JOBS.get(ref)
+    if job is None:
+        await query.answer("Esa subida ya terminó o fue cancelada.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)  # quita el botón viejo
+        except Exception:
+            pass
+        return
+    if job.user_id != uid and not es_admin(uid):
+        await query.answer("Esa subida no es tuya.", show_alert=True)
+        return
+    en_espera = cancelar_job(job)
+    log_action(uid, "cancelar", f"#{job.id} {job.nombre_base} (botón)")
+    await query.answer("🚫 Cancelando...")
+    if en_espera:
+        texto = f"🚫 #{job.id} {job.nombre_base}: cancelada y quitada de la cola."
+    else:
+        texto = f"🚫 #{job.id} {job.nombre_base}: cancelando... se detiene en unos segundos."
+    try:
+        await query.edit_message_text(texto)
+    except Exception:
+        pass
 
 async def cmd_cambiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -1388,7 +1545,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
                 await query.edit_message_text("⚠️ *¿REALMENTE quieres borrar TODOS los datos?*\n(archivos en BD, usuarios, credenciales, logs)\n\n*No se puede deshacer.*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             elif data == "adm_nuke_do":
-                for tabla in ("archivos", "logs", "usuarios", "credenciales_moodle", "credenciales_nube", "preferencias"):
+                for tabla in ("archivos", "logs", "usuarios", "credenciales_moodle", "credenciales_nube",
+                              "preferencias", "trabajos"):
                     c.execute(f"DELETE FROM {tabla}")
                 await query.edit_message_text("💀 *NUKE COMPLETO* - Todos los datos eliminados.", parse_mode='Markdown')
             elif data == "adm_nuke_cancel":
@@ -1438,9 +1596,11 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🚫 Tu cola está llena ({MAX_COLA_POR_USUARIO} enlaces). Espera a que termine alguno.")
             break
         elif pos == 0:
-            await update.message.reply_text(f"✅ #{job.id} {nombre_base} ({fmt_bytes(size) if size else 'tamaño desconocido'}): empezando ahora.")
+            await update.message.reply_text(f"✅ #{job.id} {nombre_base} ({fmt_bytes(size) if size else 'tamaño desconocido'}): empezando ahora.",
+                                            reply_markup=teclado_cancelar(job.ref))
         else:
-            await update.message.reply_text(f"⏳ #{job.id} {nombre_base} ({fmt_bytes(size) if size else 'tamaño desconocido'}): en cola, turno {pos + 1}. Ver /cola · cancelar /cancelar {job.id}")
+            await update.message.reply_text(f"⏳ #{job.id} {nombre_base} ({fmt_bytes(size) if size else 'tamaño desconocido'}): en cola, turno {pos + 1}. Ver /cola · cancelar /cancelar {job.id}",
+                                            reply_markup=teclado_cancelar(job.ref))
 
 # ==================================================
 # SERVIDOR DE SALUD (Render Web Service necesita un puerto abierto)
@@ -1563,7 +1723,7 @@ def main():
     limpiar_temporales(todo=True)   # ningún trabajo sobrevive a un reinicio: todo lo que haya es basura
     limpiar_logs_antiguos(dias=30)
     if not shutil.which('7z'):
-        print("⚠️ ADVERTENCIA: '7z' no está instalado. No podrás dividir archivos grandes.")
+        print("⚠️ ADVERTENCIA: '7z' no está instalado. Se usará el divisor interno (partes .001, .002...).")
         print("   Instala con: sudo apt install p7zip-full")
     iniciar_servidor_salud()
     app = (Application.builder()
@@ -1585,7 +1745,8 @@ def main():
     app.add_handler(CommandHandler("delall", borrar_todos))
     app.add_handler(CommandHandler("mystats", mis_estadisticas))
     app.add_handler(CommandHandler("admin", panel_admin))
-    app.add_handler(CallbackQueryHandler(admin_callback))
+    app.add_handler(CallbackQueryHandler(cb_cancelar, pattern=r'^cancel_'))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r'^adm_'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_enlace))
     print("🤖 Bot iniciado.")
     print(f"Subidas simultáneas globales: {MAX_SUBIDAS_SIMULTANEAS} · cola por usuario: {MAX_COLA_POR_USUARIO} "
