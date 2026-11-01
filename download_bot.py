@@ -15,6 +15,8 @@ import socket
 import tempfile
 import itertools
 import threading
+import zlib
+import struct
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -515,7 +517,8 @@ def _diagnostico_privados(sesion, base_url, token, ctx_id, nombre):
     except Exception as e:
         print(f"DIAG_GET error: {type(e).__name__}: {e}")
 
-def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None, filearea="draft"):
+def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None, filearea="draft",
+                   itemid=None, carpeta=None):
     url_subida = f"{(base_url or MOODLE_URL).rstrip('/')}/webservice/upload.php"
     token = getattr(sesion, 'moodle_token', None)
     if not token:
@@ -524,8 +527,13 @@ def subir_a_moodle(sesion, ruta_archivo, base_url=None, progreso=None, filearea=
                 "reintentable": False}
     cuerpo = _CuerpoMultipart(ruta_archivo, 'file_1', progreso)
     try:
+        params = {'token': token}
+        if itemid:      # mismo borrador que la parte anterior => todas quedan en la misma carpeta
+            params['itemid'] = itemid
+        if carpeta:     # carpeta dentro del borrador (ej. "/video.mp4/")
+            params['filepath'] = carpeta
         respuesta = sesion.post(url_subida,
-                                params={'token': token}, data=cuerpo,
+                                params=params, data=cuerpo,
                                 headers={'Content-Type': f'multipart/form-data; boundary={cuerpo.boundary}'},
                                 timeout=(30, 900))
         respuesta.raise_for_status()
@@ -577,41 +585,148 @@ def construir_enlace(base_url, filearea, res, nombre_defecto, token=None):
         return url
     return f"{base_url}/draftfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
 
+def zip_carpeta_moodle(sesion, base_url, itemid, carpeta):
+    """Pide a Moodle que comprima EN SU SERVIDOR una carpeta del borrador (la misma acción que el botón
+    'Descargar carpeta') y devuelve el enlace del .zip, o None si no se pudo. Nunca lanza excepciones."""
+    base = (base_url or MOODLE_URL).rstrip("/")
+    try:
+        sesskey = None
+        for pagina in ("/my/", "/"):
+            r = sesion.get(base + pagina, timeout=60)
+            m = (re.search(r'"sesskey"\s*:\s*"([A-Za-z0-9]+)"', r.text)
+                 or re.search(r'sesskey=([A-Za-z0-9]+)', r.text))
+            if m:
+                sesskey = m.group(1)
+                break
+        if not sesskey:
+            print("ZIP_CARPETA: no se encontró sesskey (¿sesión caducada?)")
+            return None
+        r = sesion.post(f"{base}/repository/draftfiles_ajax.php",
+                        data={"sesskey": sesskey, "action": "downloaddir",
+                              "itemid": itemid, "filepath": carpeta}, timeout=(30, 900))
+        print(f"ZIP_CARPETA respuesta {r.status_code}: {r.text[:300]}")
+        datos = r.json()
+        if isinstance(datos, dict) and datos.get("fileurl"):
+            return datos["fileurl"]
+    except Exception as e:
+        print(f"ZIP_CARPETA error: {type(e).__name__}: {e}")
+    return None
+
+def _num7z(v):
+    """Entero en el formato de longitud variable de 7z."""
+    first = 0
+    mask = 0x80
+    i = 0
+    while i < 8:
+        if v < (1 << (7 * (i + 1))):
+            first |= (v >> (8 * i))
+            break
+        first |= mask
+        mask >>= 1
+        i += 1
+    out = bytearray([first])
+    for _ in range(i):
+        out.append(v & 0xFF)
+        v >>= 8
+    return bytes(out)
+
+class _EscritorVolumenes:
+    """Escribe un flujo continuo repartido en volúmenes de tamaño fijo: base.001, base.002..."""
+    def __init__(self, ruta_base, tamano):
+        self.base = ruta_base
+        self.tamano = int(tamano)
+        self.n = 0
+        self.f = None
+        self.libre = 0
+        self.partes = []
+
+    def write(self, datos):
+        mv = memoryview(datos)
+        while len(mv):
+            if self.f is None or self.libre == 0:
+                if self.f:
+                    self.f.close()
+                self.n += 1
+                ruta = f"{self.base}.{self.n:03d}"
+                self.f = open(ruta, "wb")
+                self.partes.append(ruta)
+                self.libre = self.tamano
+            k = min(self.libre, len(mv))
+            self.f.write(mv[:k])
+            self.libre -= k
+            mv = mv[k:]
+
+    def close(self):
+        if self.f:
+            self.f.close()
+            self.f = None
+
 def _dividir_python(ruta_archivo, tamano_bytes):
-    """Respaldo sin 7z: parte el archivo en trozos binarios nombre.001, nombre.002...
-    (se unen con 7-Zip/HJSplit o 'copy /b' en Windows). Devuelve la lista de partes o []."""
+    """Respaldo SIN 7z instalado: crea un .7z real (modo 'store', sin comprimir) escrito directamente
+    en volúmenes nombre.7z.001, nombre.7z.002... Es el mismo formato que genera '7z a -v', así que
+    ZArchiver / 7-Zip lo abren y lo extraen tocando solo la parte .001. Devuelve la lista de partes o []."""
     directorio = os.path.dirname(os.path.abspath(ruta_archivo))
     base = os.path.basename(ruta_archivo)
-    partes = []
+    tamano_bytes = int(tamano_bytes)
+    if tamano_bytes < 1024:
+        return []
     try:
+        mtime = os.path.getmtime(ruta_archivo)
+        if os.path.getsize(ruta_archivo) == 0:
+            return []
+    except OSError:
+        return []
+    w = _EscritorVolumenes(os.path.join(directorio, base + ".7z"), tamano_bytes)
+    try:
+        w.write(b"\x00" * 32)  # hueco para la cabecera de inicio (se rellena al final)
+        crc = 0
+        total = 0
         with open(ruta_archivo, "rb") as src:
-            i = 1
             while True:
-                destino = os.path.join(directorio, f"{base}.{i:03d}")
-                restante = int(tamano_bytes)
-                escrito = 0
-                with open(destino, "wb") as dst:
-                    while restante > 0:
-                        bloque = src.read(min(4 * 1024 * 1024, restante))
-                        if not bloque:
-                            break
-                        dst.write(bloque)
-                        restante -= len(bloque)
-                        escrito += len(bloque)
-                if escrito == 0:
-                    os.remove(destino)
+                bloque = src.read(4 * 1024 * 1024)
+                if not bloque:
                     break
-                partes.append(destino)
-                i += 1
+                crc = zlib.crc32(bloque, crc)
+                total += len(bloque)
+                w.write(bloque)
+
+        nombre = (base + "\x00").encode("utf-16-le", "surrogatepass")
+        filetime = int((mtime + 11644473600) * 10_000_000)
+        hdr = bytearray()
+        hdr += b"\x01"                                            # Header
+        hdr += b"\x04"                                            #   MainStreamsInfo
+        hdr += b"\x06" + _num7z(0) + _num7z(1)                    #     PackInfo: pos 0, 1 flujo
+        hdr += b"\x09" + _num7z(total) + b"\x00"                  #       tamaño empaquetado
+        hdr += b"\x07\x0b" + _num7z(1) + b"\x00"                  #     UnpackInfo: 1 folder
+        hdr += _num7z(1) + b"\x01\x00"                            #       1 coder: Copy (id 00)
+        hdr += b"\x0c" + _num7z(total)                            #       tamaño sin empaquetar
+        hdr += b"\x0a\x01" + struct.pack("<I", crc & 0xFFFFFFFF)  #       CRC32 del archivo
+        hdr += b"\x00"                                            #     fin UnpackInfo
+        hdr += b"\x00"                                            #   fin StreamsInfo
+        hdr += b"\x05" + _num7z(1)                                #   FilesInfo: 1 archivo
+        hdr += b"\x11" + _num7z(len(nombre) + 1) + b"\x00" + nombre
+        hdr += b"\x14" + _num7z(10) + b"\x01\x00" + struct.pack("<Q", filetime)
+        hdr += b"\x00"                                            #   fin FilesInfo
+        hdr += b"\x00"                                            # fin Header
+        hdr = bytes(hdr)
+        w.write(hdr)
+        w.close()
+
+        inicio = struct.pack("<QQI", total, len(hdr), zlib.crc32(hdr) & 0xFFFFFFFF)
+        cabecera = (b"7z\xbc\xaf\x27\x1c\x00\x04"
+                    + struct.pack("<I", zlib.crc32(inicio) & 0xFFFFFFFF) + inicio)
+        with open(w.partes[0], "r+b") as f:
+            f.write(cabecera)
+        return list(w.partes)
     except Exception as e:
-        print(f"split python error: {e}\n{traceback.format_exc()}")
-        for f in partes:
+        print(f"split 7z-python error: {e}\n{traceback.format_exc()}")
+        w.close()
+        for f in w.partes:
             try:
                 os.remove(f)
             except OSError:
                 pass
         return []
-    return partes
 
 def dividir_archivo(ruta_archivo, tamano_bytes=1024 * 1024 * 1024):
     """Divide con 7z en modo 'store' (-mx=0, sin comprimir: mucho más rápido y los archivos
@@ -746,7 +861,7 @@ async def con_progreso(msg, titulo, prog, trabajo, markup=None):
         except asyncio.CancelledError:
             pass
 
-def _descargar_sync(url, destino, prog):
+def _descargar_sync(url, destino, prog, referer=""):
     """Descarga a `destino.part` con REANUDACIÓN (Range) si se corta la conexión,
     y renombra a `destino` solo cuando terminó completa."""
     parcial = destino + ".part"
@@ -755,7 +870,9 @@ def _descargar_sync(url, destino, prog):
         if prog.cancelar.is_set():
             raise JobCancelado()
         pos = os.path.getsize(parcial) if os.path.exists(parcial) else 0
-        headers = {"Range": f"bytes={pos}-"} if pos else {}
+        headers = _cabeceras_web(referer)
+        if pos:
+            headers["Range"] = f"bytes={pos}-"
         try:
             with requests.get(url, headers=headers, timeout=(30, 60), stream=True) as r:
                 if pos and r.status_code == 416:      # ya estaba completo
@@ -797,13 +914,257 @@ def _descargar_sync(url, destino, prog):
     os.replace(parcial, destino)
     return os.path.getsize(destino)
 
-async def descargar_archivo(url, destino, prog):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _descargar_sync, url, destino, prog)
+# ==================================================
+# VIDEOS EN STREAMING (HLS .m3u8, DASH .mpd, páginas con video)
+# Orden: yt-dlp (si está instalado) -> descargador HLS propio (solo .m3u8 sin cifrar)
+# ==================================================
+UA_NAVEGADOR = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Mobile Safari/537.36")
+VIDEO_ALTURA_MAX = int(os.environ.get("VIDEO_MAX_HEIGHT", "1080"))
+REFERER_RE = re.compile(r'(?im)^\s*(?:referer|referrer|ref)\s*[:=]?\s*(https?://\S+)')
 
-async def subir_archivo_a_moodle(sesion, ruta, base_url=None, prog=None, filearea="draft"):
+def _cabeceras_web(referer=""):
+    hd = {"User-Agent": UA_NAVEGADOR, "Accept": "*/*", "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"}
+    if referer:
+        p = urlparse(referer)
+        hd["Referer"] = referer
+        hd["Origin"] = f"{p.scheme}://{p.netloc}"
+    return hd
+
+def _origen(url):
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}/"
+
+def _ytdlp_disponible():
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+def _ffmpeg_exe():
+    """ffmpeg del sistema o, si no hay, el que trae el paquete pip 'imageio-ffmpeg'."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+def es_url_stream(url):
+    return urlparse(url).path.lower().endswith((".m3u8", ".mpd"))
+
+def _descargar_hls(url, destino, prog, referer=""):
+    """Descargador HLS propio (sin yt-dlp): elige la mejor calidad <= VIDEO_MAX_HEIGHT, baja los
+    segmentos en paralelo y los une. No soporta cifrado (AES-128/DRM) ni audio en lista aparte."""
+    from urllib.parse import urljoin
+    from concurrent.futures import ThreadPoolExecutor
+    s = requests.Session()
+    s.headers.update(_cabeceras_web(referer or _origen(url)))
+
+    def get(u):
+        for intento in range(1, 4):
+            if prog.cancelar.is_set():
+                raise JobCancelado()
+            try:
+                r = s.get(u, timeout=(30, 60))
+                r.raise_for_status()
+                return r.content
+            except requests.exceptions.RequestException:
+                if intento == 3:
+                    raise
+                time.sleep(2 * intento)
+
+    def leer_lista(u):
+        txt = get(u).decode("utf-8", "replace")
+        return [l.strip() for l in txt.splitlines() if l.strip()]
+
+    lineas = leer_lista(url)
+    if not lineas or not lineas[0].startswith("#EXTM3U"):
+        raise Exception("la lista .m3u8 no es válida (¿el enlace caducó?)")
+
+    if any(l.startswith("#EXT-X-STREAM-INF") for l in lineas):   # lista maestra -> elegir calidad
+        variantes = []
+        for i, l in enumerate(lineas):
+            if l.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lineas) and not lineas[i + 1].startswith("#"):
+                bw = re.search(r"BANDWIDTH=(\d+)", l)
+                al = re.search(r"RESOLUTION=\d+x(\d+)", l)
+                variantes.append((int(bw.group(1)) if bw else 0, int(al.group(1)) if al else 0, lineas[i + 1]))
+        if not variantes:
+            raise Exception("la lista maestra no trae calidades")
+        validas = [v for v in variantes if v[1] == 0 or v[1] <= VIDEO_ALTURA_MAX]
+        elegida = max(validas) if validas else min(variantes)
+        url = urljoin(url, elegida[2])
+        lineas = leer_lista(url)
+
+    if any(l.startswith("#EXT-X-KEY") and "METHOD=NONE" not in l for l in lineas):
+        raise Exception("el video está cifrado; instala yt-dlp (pip install yt-dlp) para poder bajarlo")
+    init = None
+    for l in lineas:
+        if l.startswith("#EXT-X-MAP"):
+            m = re.search(r'URI="([^"]+)"', l)
+            if m:
+                init = urljoin(url, m.group(1))
+    segmentos = [urljoin(url, l) for l in lineas if not l.startswith("#")]
+    if not segmentos:
+        raise Exception("la lista .m3u8 no tiene segmentos")
+
+    base = os.path.splitext(destino)[0]
+    ext = ".mp4" if init else ".ts"
+    parcial = base + ext + ".part"
+    hechos = bytes_seg = 0
+    prog.hecho = 0
+    with open(parcial, "wb") as f:
+        if init:
+            d = get(init)
+            f.write(d)
+            prog.hecho += len(d)
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for i in range(0, len(segmentos), 8):
+                for datos in ex.map(get, segmentos[i:i + 8]):
+                    f.write(datos)
+                    hechos += 1
+                    bytes_seg += len(datos)
+                    prog.hecho += len(datos)
+                prog.total = int(bytes_seg / hechos * len(segmentos))
+                if prog.hecho > MAX_FILE_SIZE:
+                    raise Exception("el video supera el límite de tamaño permitido")
+                if shutil.disk_usage(os.path.dirname(os.path.abspath(parcial))).free < MARGEN_DISCO:
+                    raise Exception("se agotó el espacio en disco durante la descarga")
+    final = base + ext
+    os.replace(parcial, final)
+    ff = _ffmpeg_exe()
+    if ext == ".ts" and ff:     # .ts -> .mp4 sin recodificar (más compatible)
+        mp4 = base + ".mp4"
+        try:
+            subprocess.run([ff, "-y", "-loglevel", "error", "-i", final, "-c", "copy", mp4],
+                           check=True, timeout=3600)
+            os.remove(final)
+            final = mp4
+        except Exception as e:
+            print(f"⚠️ No se pudo pasar a mp4 ({type(e).__name__}); se deja como .ts")
+            try:
+                os.remove(mp4)
+            except OSError:
+                pass
+    prog.ruta_final = final
+    return os.path.getsize(final)
+
+def _descargar_ytdlp(url, destino, prog, referer=""):
+    """Descarga con yt-dlp (YouTube y cientos de sitios, HLS/DASH, cifrado AES-128, audio aparte...)."""
+    import yt_dlp
+    carpeta = os.path.dirname(os.path.abspath(destino))
+    ff = _ffmpeg_exe()
+    alto = VIDEO_ALTURA_MAX
+    formato = (f"bv*[height<={alto}]+ba/b[height<={alto}]/bv*+ba/b" if ff
+               else f"b[height<={alto}]/b")
+
+    def hook(d):
+        if prog.cancelar.is_set():
+            raise JobCancelado()
+        if d.get("status") == "downloading":
+            prog.total = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+            prog.hecho = int(d.get("downloaded_bytes") or 0)
+
+    opciones = {
+        "outtmpl": os.path.join(carpeta, "dl.%(ext)s"), "format": formato,
+        "merge_output_format": "mp4", "noplaylist": True, "quiet": True, "no_warnings": True,
+        "noprogress": True, "retries": 5, "fragment_retries": 10, "socket_timeout": 60,
+        "concurrent_fragment_downloads": 4, "max_filesize": MAX_FILE_SIZE,
+        "http_headers": _cabeceras_web(referer), "progress_hooks": [hook],
+    }
+    if ff:
+        opciones["ffmpeg_location"] = ff
+    try:
+        with yt_dlp.YoutubeDL(opciones) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        if prog.cancelar.is_set():
+            raise JobCancelado()
+        raise Exception(f"yt-dlp: {str(e)[:250]}")
+    if prog.cancelar.is_set():
+        raise JobCancelado()
+    candidatos = [x for x in os.listdir(carpeta)
+                  if x.startswith("dl.") and not x.endswith((".part", ".ytdl", ".temp"))]
+    if not candidatos:
+        raise Exception("yt-dlp no generó ningún archivo (¿supera el límite de tamaño?)")
+    mejor = max(candidatos, key=lambda x: os.path.getsize(os.path.join(carpeta, x)))
+    ext = os.path.splitext(mejor)[1] or ".mp4"
+    titulo = sanitize_filename(str(info.get("title") or "")) if isinstance(info, dict) else ""
+    nombre = (titulo[:90] or os.path.splitext(os.path.basename(destino))[0]) + ext
+    final = os.path.join(carpeta, nombre)
+    os.replace(os.path.join(carpeta, mejor), final)
+    prog.ruta_final = final
+    return os.path.getsize(final)
+
+def _descargar_auto(url, destino, prog, tipo="directo", referer=""):
+    if tipo == "directo":
+        return _descargar_sync(url, destino, prog, referer)
+    errores = []
+    if _ytdlp_disponible():
+        try:
+            return _descargar_ytdlp(url, destino, prog, referer)
+        except JobCancelado:
+            raise
+        except Exception as e:
+            errores.append(str(e))
+            print(f"⚠️ yt-dlp falló: {e}")
+    if urlparse(url).path.lower().endswith(".m3u8"):
+        try:
+            return _descargar_hls(url, destino, prog, referer)
+        except JobCancelado:
+            raise
+        except Exception as e:
+            errores.append(f"HLS: {e}")
+    if not errores:
+        errores.append("este tipo de enlace necesita yt-dlp (pip install yt-dlp)")
+    raise Exception(" | ".join(errores)[:400])
+
+async def analizar_url(url, referer=""):
+    """Devuelve (tipo, tamaño). tipo: 'directo' (archivo normal) o 'stream' (HLS/DASH/página de video)."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url, prog, filearea)
+    def sync():
+        if es_url_stream(url):
+            return "stream", 0
+        hd = _cabeceras_web(referer)
+        try:
+            r = requests.head(url, headers=hd, allow_redirects=True, timeout=30)
+            if r.status_code in (400, 403, 405, 501):
+                r = requests.get(url, headers=hd, allow_redirects=True, timeout=30, stream=True)
+                r.close()
+            r.raise_for_status()
+        except requests.exceptions.RequestException:
+            if _ytdlp_disponible():
+                return "stream", 0
+            raise
+        ctipo = r.headers.get("Content-Type", "").lower()
+        if "mpegurl" in ctipo:
+            return "stream", 0
+        if "text/html" in ctipo:
+            if _ytdlp_disponible():
+                return "stream", 0
+            raise Exception("La URL es una página web, no un archivo directo. Para bajar videos de "
+                            "páginas hay que instalar yt-dlp (pip install yt-dlp)")
+        try:
+            size = int(r.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            size = 0
+        if size > MAX_FILE_SIZE:
+            raise Exception(f"Archivo demasiado grande ({size/(1024**3):.2f} GB > {MAX_FILE_SIZE/(1024**3):.0f} GB)")
+        return "directo", size
+    return await loop.run_in_executor(None, sync)
+
+async def descargar_archivo(url, destino, prog, tipo="directo", referer=""):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _descargar_auto, url, destino, prog, tipo, referer)
+
+async def subir_archivo_a_moodle(sesion, ruta, base_url=None, prog=None, filearea="draft",
+                                 itemid=None, carpeta=None):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, subir_a_moodle, sesion, ruta, base_url, prog, filearea,
+                                      itemid, carpeta)
 
 async def dividir_archivo_async(ruta, tamano_bytes=1024 * 1024 * 1024):
     loop = asyncio.get_running_loop()
@@ -828,6 +1189,8 @@ class Job:
     ref: str = field(default_factory=lambda: uuid.uuid4().hex[:12])  # identificador único (BD y botones)
     fue_cancelado: bool = False        # True si se canceló (usuario o timeout): hay que borrar sus registros
     msg_actual: object = None          # último mensaje con progreso (para limpiarlo al cancelar)
+    tipo: str = "directo"              # "directo" (archivo normal) o "stream" (HLS/DASH/página de video)
+    referer: str = ""                  # Referer opcional (algunos servidores dan 403 sin él)
 
     def comprobar(self):
         if self.cancelar.is_set():
@@ -1030,7 +1393,7 @@ async def procesar_job(bot, job):
         job.msg_actual = msg_dl
         try:
             tamano = await con_progreso(msg_dl, titulo_dl, prog_dl,
-                                        descargar_archivo(job.url, ruta, prog_dl), kb)
+                                        descargar_archivo(job.url, ruta, prog_dl, job.tipo, job.referer), kb)
         except JobCancelado:
             raise
         except Exception as e:
@@ -1038,10 +1401,20 @@ async def procesar_job(bot, job):
             log_error(uid, f"Descarga fallida: {e}", traceback.format_exc())
             await say(f"❌ No pude descargar {nombre_base}: {str(e)[:300]}")
             return
+        ruta_final = getattr(prog_dl, "ruta_final", None)   # los videos en streaming cambian de nombre/extensión
+        if ruta_final and os.path.exists(ruta_final):
+            ruta = ruta_final
+            nombre_base = os.path.basename(ruta_final)
+            job.nombre_base = nombre_base
+            tamano = os.path.getsize(ruta_final)
         await editar_seguro(msg_dl, f"✅ Descargado: {nombre_base} ({fmt_bytes(tamano)}) 100%")
         job.comprobar()
 
         # 3. Subida (con reintentos y re-login si se corta la conexión)
+        # Si el archivo se divide (y la nube usa 'draft'), todas las partes se suben al MISMO borrador
+        # y dentro de una carpeta con el nombre del archivo.
+        grupo = {"itemid": None, "carpeta": None}
+
         async def subir_con_progreso(ruta_local, etiqueta):
             nonlocal sesion
             res = None
@@ -1052,8 +1425,11 @@ async def procesar_job(bot, job):
                 msg = await say(texto_progreso(titulo, prog), reply_markup=kb)
                 job.msg_actual = msg
                 res = await con_progreso(msg, titulo, prog,
-                                         subir_archivo_a_moodle(sesion, ruta_local, base_url, prog, filearea), kb)
+                                         subir_archivo_a_moodle(sesion, ruta_local, base_url, prog, filearea,
+                                                         grupo["itemid"], grupo["carpeta"]), kb)
                 if subida_ok(res):
+                    if grupo["carpeta"] and not grupo["itemid"] and isinstance(res, dict):
+                        grupo["itemid"] = res.get("itemid")   # las siguientes partes van al mismo borrador
                     await editar_seguro(msg, f"✅ {etiqueta} subido (100%)")
                     return res
                 job.comprobar()
@@ -1090,6 +1466,9 @@ async def procesar_job(bot, job):
                 partes = [ruta]
 
             job.estado = "subiendo"
+            grupo["itemid"] = None
+            grupo["carpeta"] = ("/" + nombre_base.replace("/", "_").replace("\\", "_").strip() + "/"
+                                if dividir and filearea == "draft" else None)
             n = len(partes)
             filas, enlaces = [], []
             resultado, detalle_error = "ok", ""
@@ -1143,8 +1522,24 @@ async def procesar_job(bot, job):
                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', filas)
                 log_action(uid, "subida", f"{nombre_base} ({tamano/(1024**2):.1f}MB, {n} parte(s))")
                 if dividir:
-                    await enviar_lista_html(say, f"📎 <b>{h(nombre_base)}</b> - Partes (únelas con 7-Zip):\n\n",
+                    cab = (f"📎 <b>{h(nombre_base)}</b> - {n} partes, todas en la carpeta <b>{h(nombre_base)}</b> "
+                           f"de tu área de archivos. Abre la parte .001 con ZArchiver/7-Zip:\n\n")
+                    await enviar_lista_html(say, cab,
                                             [f"<code>{h(e)}</code>" for e in enlaces])
+                    if grupo["itemid"] and grupo["carpeta"]:   # un solo zip con todas las partes
+                        url_zip = None
+                        try:
+                            url_zip = await asyncio.to_thread(zip_carpeta_moodle, sesion, base_url,
+                                                              grupo["itemid"], grupo["carpeta"])
+                            if not url_zip:   # la sesión pudo caducar durante la subida: 1 reintento
+                                sesion = await asyncio.to_thread(login_moodle, usuario, contraseña, base_url)
+                                url_zip = await asyncio.to_thread(zip_carpeta_moodle, sesion, base_url,
+                                                                  grupo["itemid"], grupo["carpeta"])
+                        except Exception as e:
+                            print(f"ZIP_CARPETA fallo: {type(e).__name__}: {e}")
+                        if url_zip:
+                            await say(f"📦 <b>Todo en un solo zip</b> (ábrelo con ZArchiver):\n\n"
+                                      f"<code>{h(url_zip)}</code>", parse_mode='HTML')
                 else:
                     await say(f"✅ <b>Subido exitosamente</b>\n\n<code>{h(enlaces[0])}</code>", parse_mode='HTML')
                 return
@@ -1564,7 +1959,9 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip()
     if texto.startswith("/") or not texto.startswith("http"):
         return
-    urls = list(dict.fromkeys(URL_RE.findall(texto)))[:MAX_ENLACES_POR_MENSAJE]  # sin repetidos
+    m_ref = REFERER_RE.search(texto)              # línea opcional "referer: https://sitio/"
+    referer = m_ref.group(1) if m_ref else ""
+    urls = [u for u in dict.fromkeys(URL_RE.findall(texto)) if u != referer][:MAX_ENLACES_POR_MENSAJE]
     if not urls:
         return
     user_id = update.effective_user.id
@@ -1576,19 +1973,21 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Nube activa: {cfg['nombre']}. Primero usa /setmoodle usuario contraseña (o /cambiar para elegir otra nube)")
         return
 
-    for url in urls:
+    for n_url, url in enumerate(urls, 1):
         parsed = urlparse(url)
         nombre_base = unquote(parsed.path.split("/")[-1]) if parsed.path else ""
         nombre_base = sanitize_filename(nombre_base)
         if not nombre_base or len(nombre_base) > 100:
             nombre_base = f"archivo_{int(time.time())}"
         try:
-            size = await verificar_url(url)
+            tipo, size = await analizar_url(url, referer)
         except Exception as e:
             await update.message.reply_text(f"❌ {nombre_base}: {str(e)[:300]}")
             continue
+        if tipo == "stream":
+            nombre_base = f"video_{int(time.time())}_{n_url}.mp4"   # el nombre real se pone al terminar
         job = Job(id=next(_CONTADOR_JOBS), user_id=user_id, chat_id=chat_id, url=url,
-                  nube=nube, nombre_base=nombre_base, size=size)
+                  nube=nube, nombre_base=nombre_base, size=size, tipo=tipo, referer=referer)
         estado, pos = encolar(context.bot, job)
         if estado == "dup":
             await update.message.reply_text(f"♻️ {nombre_base} ya está en tu cola.")
@@ -1722,9 +2121,10 @@ def main():
     init_db()
     limpiar_temporales(todo=True)   # ningún trabajo sobrevive a un reinicio: todo lo que haya es basura
     limpiar_logs_antiguos(dias=30)
+    print(f"ℹ️ Videos en streaming: yt-dlp={'sí' if _ytdlp_disponible() else 'NO (pip install yt-dlp)'} · "
+          f"ffmpeg={'sí' if _ffmpeg_exe() else 'NO (pip install imageio-ffmpeg)'}")
     if not shutil.which('7z'):
-        print("⚠️ ADVERTENCIA: '7z' no está instalado. Se usará el divisor interno (partes .001, .002...).")
-        print("   Instala con: sudo apt install p7zip-full")
+        print("ℹ️ '7z' no está instalado. Se usará el divisor interno, que también genera partes .7z (nombre.7z.001, .002...).")
     iniciar_servidor_salud()
     app = (Application.builder()
            .token(BOT_TOKEN)
