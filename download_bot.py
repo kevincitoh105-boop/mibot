@@ -59,7 +59,9 @@ CLOUDS = {
         "requiere_cuenta": True,
         "filearea": os.environ.get("CURSAD_FILEAREA", "draft")},
     4: {"nombre": "toDus (chat privado o grupo)", "url": None,
-        "requiere_cuenta": False, "tipo": "todus"},
+        "requiere_cuenta": False, "tipo": "todus",
+        # ToDus: cada volumen se sube por separado y se entrega también su URL directa.
+        "max_parte": int(os.environ.get("TODUS_MAX_PART_MB", "150")) * 1024 * 1024},
 }
 # Destino fijo configurado en Render. El número emisor se guarda por usuario con /settodus.
 TODUS_DESTINO = os.environ.get("TODUS_DESTINO", "").strip()
@@ -328,8 +330,9 @@ def _normalizar_destino_todus(destino):
 def subir_y_enviar_todus(cliente, destino, ruta, nombre, progreso, cancelar):
     """Sube el archivo a toDus y lo envía como adjunto a un chat privado o grupo.
 
-    Usa mmap para no cargar archivos grandes completos en RAM. En grupos usa
-    GroupClient.send_file(), que construye el mensaje MUC Light de archivo.
+    Usa mmap para no cargar archivos grandes completos en RAM. Devuelve
+    (id_mensaje, url_directa) para compartir la descarga en navegador.
+    En grupos usa GroupClient.send_file(), que construye el mensaje MUC Light.
     """
     import mmap
     from todus import FileType
@@ -374,14 +377,25 @@ def subir_y_enviar_todus(cliente, destino, ruta, nombre, progreso, cancelar):
     # Su firma es (group_id, url, file_name, file_size, caption=...). No pasar
     # aquí el FileType: ese argumento corresponde al método de chat privado.
     if tipo_destino == "grupo":
-        return cliente.groups.send_file(
+        msg_id = cliente.groups.send_file(
             destino_limpio, url, nombre, tamano, caption=nombre
         )
+    else:
+        msg_id = cliente.send_file_message(
+            destino_limpio, url, tipo,
+            caption=nombre, file_name=nombre, file_size=tamano
+        )
 
-    return cliente.send_file_message(
-        destino_limpio, url, tipo,
-        caption=nombre, file_name=nombre, file_size=tamano
-    )
+    # La URL corta de ToDus se resuelve a la URL real (normalmente firmada).
+    # Esa URL se puede abrir desde el navegador mientras siga vigente.
+    try:
+        url_directa = cliente.get_real_download_url(url)
+    except Exception as exc:
+        # El adjunto ya fue enviado. No reportamos todo el envío como fallido
+        # solo porque no se pudo resolver el enlace adicional.
+        print(f"No se pudo resolver URL directa de ToDus para {nombre}: {exc}")
+        url_directa = url
+    return msg_id, url_directa
 
 # ==================================================
 # ARCHIVOS TEMPORALES
@@ -1593,28 +1607,77 @@ async def procesar_job(bot, job):
         await editar_seguro(msg_dl, f"✅ Descargado: {nombre_base} ({fmt_bytes(tamano)}) 100%")
         job.comprobar()
 
-        # 3. ToDus: subir el archivo al servicio y enviarlo como adjunto al chat privado.
-        # No se modifica el flujo Moodle de las otras tres nubes.
+        # 3. ToDus: divide en volúmenes de hasta 150 MB, envía cada adjunto
+        # y devuelve enlaces directos para abrir/descargar desde el navegador.
         if es_todus:
-            job.estado = "enviando a toDus"
-            prog_td = Progreso(tamano, job.cancelar)
-            titulo_td = f"📤 Enviando {nombre_base} a toDus → {TODUS_DESTINO}"
-            msg_td = await say(texto_progreso(titulo_td, prog_td), reply_markup=kb)
-            job.msg_actual = msg_td
+            limite_todus = cfg.get("max_parte", 150 * 1024 * 1024)
+            dividir_todus = tamano > limite_todus
+            partes_todus = [ruta]
+            enlaces_todus = []
             try:
-                msg_id = await con_progreso(
-                    msg_td, titulo_td, prog_td,
-                    asyncio.to_thread(subir_y_enviar_todus, sesion, TODUS_DESTINO,
-                                      ruta, nombre_base, prog_td, job.cancelar), kb)
-                job.comprobar()
-                await editar_seguro(msg_td, f"✅ {nombre_base} enviado como archivo adjunto a toDus ({TODUS_DESTINO}).")
-                log_action(uid, "envio_todus", f"{nombre_base} ({tamano} bytes) -> {TODUS_DESTINO}; msg={msg_id}")
+                if dividir_todus:
+                    job.estado = "dividiendo para toDus"
+                    msg_div_td = await say(
+                        f"📦 Dividiendo {nombre_base} en partes de hasta {fmt_bytes(limite_todus)}...",
+                        reply_markup=kb)
+                    job.msg_actual = msg_div_td
+                    partes_todus = await dividir_archivo_async(ruta, limite_todus)
+                    if not partes_todus:
+                        await editar_seguro(msg_div_td, f"❌ No pude dividir {nombre_base}.")
+                        await say("❌ Falló la división del archivo. No se ha subido a toDus.")
+                        return
+                    await editar_seguro(msg_div_td,
+                                         f"📦 {nombre_base}: preparado en {len(partes_todus)} partes.")
+
+                total_partes = len(partes_todus)
+                for indice, parte in enumerate(partes_todus, 1):
+                    job.comprobar()
+                    nombre_parte = os.path.basename(parte)
+                    tamano_parte = os.path.getsize(parte)
+                    job.estado = f"enviando a toDus ({indice}/{total_partes})"
+                    prog_td = Progreso(tamano_parte, job.cancelar)
+                    titulo_td = (f"📤 Enviando {nombre_base} a toDus "
+                                 f"({indice}/{total_partes}) → {TODUS_DESTINO}")
+                    msg_td = await say(texto_progreso(titulo_td, prog_td), reply_markup=kb)
+                    job.msg_actual = msg_td
+                    msg_id, url_directa = await con_progreso(
+                        msg_td, titulo_td, prog_td,
+                        asyncio.to_thread(subir_y_enviar_todus, sesion, TODUS_DESTINO,
+                                          parte, nombre_parte, prog_td, job.cancelar), kb)
+                    job.comprobar()
+                    enlaces_todus.append((nombre_parte, url_directa))
+                    await editar_seguro(msg_td,
+                        f"✅ {nombre_parte} enviado a toDus ({indice}/{total_partes}).")
+                    log_action(uid, "envio_todus",
+                               f"{nombre_parte} ({tamano_parte} bytes) -> {TODUS_DESTINO}; msg={msg_id}")
+                    if dividir_todus:
+                        try:
+                            os.remove(parte)
+                        except OSError:
+                            pass
+
+                cabecera = (f"🔗 <b>Enlaces directos de descarga de {h(nombre_base)}</b>\n"
+                            "Abre cada enlace en el navegador. Si el enlace firmado caduca, "
+                            "habrá que volver a generarlo subiendo el archivo otra vez.\n\n")
+                lineas = [f'📥 <a href="{html.escape(url, quote=True)}">{h(nombre)}</a>'
+                          for nombre, url in enlaces_todus]
+                await enviar_lista_html(say, cabecera, lineas)
+                if dividir_todus:
+                    await say("🧩 Para reconstruir el archivo, descarga todas las partes y "
+                              "abre la primera (.001) con ZArchiver o 7-Zip.")
             except JobCancelado:
                 raise
             except Exception as e:
                 log_error(uid, f"Error enviando a toDus: {e}", traceback.format_exc())
-                await editar_seguro(msg_td, f"❌ Falló el envío de {nombre_base} a toDus.")
-                await say(f"toDus no pudo completar el envío: {str(e)[:500]}")
+                await say(f"❌ toDus no pudo completar el envío de {nombre_base}: {str(e)[:500]}")
+            finally:
+                if dividir_todus:
+                    for parte in partes_todus:
+                        if os.path.exists(parte):
+                            try:
+                                os.remove(parte)
+                            except OSError:
+                                pass
             return
 
         # 4. Subida Moodle (con reintentos y re-login si se corta la conexión)
