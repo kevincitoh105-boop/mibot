@@ -30,6 +30,8 @@ from telegram.ext import (Application, CommandHandler, MessageHandler, filters,
 # ==================================================
 # CONFIGURACIÓN OBLIGATORIA
 # ==================================================
+from dotenv import load_dotenv
+load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("No se encontró BOT_TOKEN en variables de entorno.")
@@ -56,7 +58,13 @@ CLOUDS = {
     3: {"nombre": "Cursad JovenClub", "url": os.environ.get("CURSAD_URL", "https://cursad.jovenclub.cu").rstrip("/"),
         "requiere_cuenta": True,
         "filearea": os.environ.get("CURSAD_FILEAREA", "draft")},
+    4: {"nombre": "toDus (chat privado o grupo)", "url": None,
+        "requiere_cuenta": False, "tipo": "todus"},
 }
+# Destino fijo configurado en Render. El número emisor se guarda por usuario con /settodus.
+TODUS_DESTINO = os.environ.get("TODUS_DESTINO", "").strip()
+TODUS_NUMERO_ENV = os.environ.get("TODUS_NUMERO", "").strip()
+TODUS_PASSWORD_ENV = os.environ.get("TODUS_PASSWORD", "")
 NUBE_POR_DEFECTO = 1
 ADMIN_IDS = [5293884821]
 
@@ -167,6 +175,8 @@ def init_db():
                       PRIMARY KEY (telegram_id, nube))''')
         c.execute('''CREATE TABLE IF NOT EXISTS preferencias
                      (telegram_id INTEGER PRIMARY KEY, nube INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS credenciales_todus
+                     (telegram_id INTEGER PRIMARY KEY, numero TEXT, contraseña TEXT)''')
         # Trabajos activos (en cola o en curso). Al cancelar, terminar o reiniciar el bot, se borran.
         c.execute('''CREATE TABLE IF NOT EXISTS trabajos
                      (ref TEXT PRIMARY KEY, job_id INTEGER, telegram_id INTEGER, nombre TEXT,
@@ -242,6 +252,136 @@ def guardar_credenciales_moodle(telegram_id, usuario, contraseña, nube=None):
     with get_db_conn() as conn:
         conn.execute("INSERT OR REPLACE INTO credenciales_nube (telegram_id, nube, usuario, contraseña) VALUES (?, ?, ?, ?)",
                      (telegram_id, nube, usuario, contraseña))
+
+def obtener_credenciales_todus(telegram_id):
+    """Obtiene el número emisor y la contraseña de toDus guardados para el usuario."""
+    with get_db_conn() as conn:
+        fila = conn.execute(
+            "SELECT numero, contraseña FROM credenciales_todus WHERE telegram_id = ?",
+            (telegram_id,)).fetchone()
+    if fila:
+        numero, contraseña = fila
+        try:
+            contraseña = decrypt(contraseña)
+        except Exception:
+            log_error(telegram_id, "Error al desencriptar credenciales toDus", traceback.format_exc())
+        return numero, contraseña
+    if TODUS_NUMERO_ENV and TODUS_PASSWORD_ENV:
+        return TODUS_NUMERO_ENV, TODUS_PASSWORD_ENV
+    return None, None
+
+def guardar_credenciales_todus(telegram_id, numero, contraseña):
+    almacenada = encrypt(contraseña) if CIPHER_KEY else contraseña
+    with get_db_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO credenciales_todus (telegram_id, numero, contraseña) VALUES (?, ?, ?)",
+                     (telegram_id, numero, almacenada))
+
+def crear_cliente_todus(numero, contraseña):
+    """Autentica con credenciales de cuenta normales, sin usar el login vulnerable solo por teléfono."""
+    from todus import ToDusClient2
+    cliente = ToDusClient2(numero, contraseña)
+    cliente.login()
+    return cliente
+
+def _tipo_archivo_todus(nombre):
+    """Selecciona el tipo de adjunto que verá el destinatario en toDus."""
+    from todus import FileType
+    ext = os.path.splitext(nombre.lower())[1]
+    if ext in {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".3gp", ".mpeg", ".mpg"}:
+        return FileType.VIDEO
+    if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+        return FileType.PICTURE
+    if ext in {".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus"}:
+        return FileType.AUDIO
+    return FileType.FILE
+
+def _normalizar_destino_todus(destino):
+    """Devuelve (tipo, destino). Acepta teléfono cubano o JID MUC Light.
+
+    Para grupos se acepta tanto el JID completo como el JID con recurso
+    (grupo@muclight.im.todus.cu/usuario@im.todus.cu). El SDK espera el ID
+    desnudo del grupo en GroupClient.send_file().
+    """
+    valor = str(destino or "").strip()
+    if not valor:
+        raise RuntimeError("Falta configurar TODUS_DESTINO en las variables de entorno de Render.")
+
+    # Un JID de grupo puede venir con /recurso al final.
+    if "@muclight.im.todus.cu" in valor.lower():
+        jid_base = valor.split("/", 1)[0]
+        match = re.fullmatch(r"([A-Za-z0-9_-]+)@muclight\.im\.todus\.cu", jid_base, re.IGNORECASE)
+        if not match:
+            raise RuntimeError("JID de grupo no válido. Usa ID@muclight.im.todus.cu, sin espacios.")
+        return "grupo", match.group(1)
+
+    # Compatibilidad con envío privado por número cubano.
+    numero = re.sub(r"[\s+()-]", "", valor)
+    if numero.isdigit() and len(numero) == 10 and numero.startswith("53"):
+        return "privado", numero
+
+    raise RuntimeError(
+        "TODUS_DESTINO debe ser un teléfono cubano de 10 dígitos (53...) "
+        "o un JID de grupo terminado en @muclight.im.todus.cu."
+    )
+
+
+def subir_y_enviar_todus(cliente, destino, ruta, nombre, progreso, cancelar):
+    """Sube el archivo a toDus y lo envía como adjunto a un chat privado o grupo.
+
+    Usa mmap para no cargar archivos grandes completos en RAM. En grupos usa
+    GroupClient.send_file(), que construye el mensaje MUC Light de archivo.
+    """
+    import mmap
+    from todus import FileType
+    tipo_destino, destino_limpio = _normalizar_destino_todus(destino)
+    tamano = os.path.getsize(ruta)
+    tipo = _tipo_archivo_todus(nombre)
+    def avance(hecho, total):
+        if cancelar.is_set():
+            raise JobCancelado()
+        progreso.total = total
+        progreso.hecho = hecho
+    with open(ruta, "rb") as archivo:
+        if tamano == 0:
+            raise RuntimeError("toDus no admite enviar un archivo vacío.")
+        with mmap.mmap(archivo.fileno(), 0, access=mmap.ACCESS_READ) as datos:
+            # Evitamos upload_file() porque algunas revisiones de todus-sdk
+            # mezclan las firmas de ToDusClient y ToDusClient2 y terminan
+            # pasando file_name dos veces a reserve_upload_url().
+            # La API pública de ToDusClient2 reserva la URL con (size, type).
+            url_subida, url_descarga = cliente.reserve_upload_url(
+                tamano, tipo, file_name=nombre
+            )
+            if not url_subida or not url_descarga:
+                raise RuntimeError("toDus no devolvió las URL necesarias para subir el archivo.")
+            from todus.client.file import _ProgressReader
+            datos_con_progreso = _ProgressReader(datos, avance)
+            respuesta = cliente.session.put(
+                url_subida,
+                data=datos_con_progreso,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(tamano),
+                },
+                timeout=300,
+            )
+            respuesta.raise_for_status()
+            avance(tamano, tamano)
+            url = url_descarga
+    if cancelar.is_set():
+        raise JobCancelado()
+    # El SDK 1.10.x implementa el envío MUC Light en GroupClient.send_file().
+    # Su firma es (group_id, url, file_name, file_size, caption=...). No pasar
+    # aquí el FileType: ese argumento corresponde al método de chat privado.
+    if tipo_destino == "grupo":
+        return cliente.groups.send_file(
+            destino_limpio, url, nombre, tamano, caption=nombre
+        )
+
+    return cliente.send_file_message(
+        destino_limpio, url, tipo,
+        caption=nombre, file_name=nombre, file_size=tamano
+    )
 
 # ==================================================
 # ARCHIVOS TEMPORALES
@@ -585,10 +725,13 @@ def construir_enlace(base_url, filearea, res, nombre_defecto, token=None):
         return url
     return f"{base_url}/draftfile.php/{ctx_id}/user/draft/{res['itemid']}{quote(ruta_srv)}{quote(nom_srv)}"
 
-def zip_carpeta_moodle(sesion, base_url, itemid, carpeta):
+ZIP_DIAG = {"motivo": ""}   # último motivo por el que falló el zip (se muestra en Telegram)
+
+def zip_carpeta_moodle(sesion, base_url, itemid, carpeta, nombre_zip=None):
     """Pide a Moodle que comprima EN SU SERVIDOR una carpeta del borrador (la misma acción que el botón
     'Descargar carpeta') y devuelve el enlace del .zip, o None si no se pudo. Nunca lanza excepciones."""
     base = (base_url or MOODLE_URL).rstrip("/")
+    ZIP_DIAG["motivo"] = ""
     try:
         sesskey = None
         for pagina in ("/my/", "/"):
@@ -600,16 +743,36 @@ def zip_carpeta_moodle(sesion, base_url, itemid, carpeta):
                 break
         if not sesskey:
             print("ZIP_CARPETA: no se encontró sesskey (¿sesión caducada?)")
+            ZIP_DIAG["motivo"] = "no encontré el sesskey de Moodle (¿sesión caducada?)"
             return None
         r = sesion.post(f"{base}/repository/draftfiles_ajax.php",
                         data={"sesskey": sesskey, "action": "downloaddir",
                               "itemid": itemid, "filepath": carpeta}, timeout=(30, 900))
         print(f"ZIP_CARPETA respuesta {r.status_code}: {r.text[:300]}")
+        ZIP_DIAG["motivo"] = f"Moodle respondió {r.status_code}: {r.text[:200]}"
         datos = r.json()
         if isinstance(datos, dict) and datos.get("fileurl"):
-            return datos["fileurl"]
+            url_zip = datos["fileurl"]
+            if nombre_zip:
+                try:
+                    from urllib.parse import unquote
+                    mz = re.search(r'/draft/(\d+)/(?:.*/)?([^/?#]+)$', url_zip)
+                    if mz and unquote(mz.group(2)) != nombre_zip:
+                        rn = sesion.post(f"{base}/repository/draftfiles_ajax.php",
+                                         data={"sesskey": sesskey, "action": "updatefile",
+                                               "itemid": mz.group(1), "filepath": "/",
+                                               "filename": unquote(mz.group(2)),
+                                               "newfilename": nombre_zip}, timeout=60)
+                        print(f"ZIP_CARPETA renombrar {rn.status_code}: {rn.text[:200]}")
+                        rj = rn.json()
+                        if isinstance(rj, dict) and not rj.get("error"):
+                            url_zip = url_zip[:url_zip.rindex("/") + 1] + quote(nombre_zip)
+                except Exception as e:
+                    print(f"ZIP_CARPETA no se pudo renombrar: {type(e).__name__}: {e}")
+            return url_zip
     except Exception as e:
         print(f"ZIP_CARPETA error: {type(e).__name__}: {e}")
+        ZIP_DIAG["motivo"] = f"{type(e).__name__}: {e}"
     return None
 
 def _num7z(v):
@@ -1347,10 +1510,20 @@ async def procesar_job(bot, job):
     async def say(texto, **kw):
         return await decir(bot, job.chat_id, texto, **kw)
 
-    usuario, contraseña = obtener_credenciales_moodle(uid, job.nube)
-    if not usuario:
-        await say(f"❌ {nombre_base}: ya no hay credenciales guardadas para {cfg['nombre']}. Usa /setmoodle.")
-        return
+    es_todus = cfg.get("tipo") == "todus"
+    if es_todus:
+        usuario, contraseña = obtener_credenciales_todus(uid)
+        if not usuario or not contraseña:
+            await say(f"❌ {nombre_base}: primero configura tu cuenta emisora con /settodus número contraseña.")
+            return
+        if not TODUS_DESTINO:
+            await say("❌ Falta TODUS_DESTINO en las variables de entorno de Render. Configúralo con un teléfono cubano o el JID del grupo toDus.")
+            return
+    else:
+        usuario, contraseña = obtener_credenciales_moodle(uid, job.nube)
+        if not usuario:
+            await say(f"❌ {nombre_base}: ya no hay credenciales guardadas para {cfg['nombre']}. Usa /setmoodle.")
+            return
 
     # --- Espacio en disco (se comprueba AL EMPEZAR, no al encolar) ---
     limite = cfg.get("max_parte") or MAX_SPLIT_SIZE
@@ -1376,11 +1549,21 @@ async def procesar_job(bot, job):
         msg_login = await say(f"🔐 {nombre_base}: iniciando sesión en {cfg['nombre']}...", reply_markup=kb)
         job.msg_actual = msg_login
         try:
-            sesion = await asyncio.to_thread(login_moodle, usuario, contraseña, base_url)
-        except MoodleError as e:
-            log_action(uid, "login_error", f"{type(e).__name__}: {e.detalle}"[:300])
-            await editar_seguro(msg_login, f"❌ {nombre_base}: no se pudo iniciar sesión")
-            await say(e.usuario_msg)
+            if es_todus:
+                sesion = await asyncio.to_thread(crear_cliente_todus, usuario, contraseña)
+            else:
+                sesion = await asyncio.to_thread(login_moodle, usuario, contraseña, base_url)
+        except Exception as e:
+            if es_todus:
+                log_error(uid, "Login toDus fallido", traceback.format_exc())
+                await editar_seguro(msg_login, f"❌ {nombre_base}: no se pudo iniciar sesión en toDus")
+                await say(f"Comprueba la cuenta configurada con /settodus. Detalle: {str(e)[:300]}")
+            elif isinstance(e, MoodleError):
+                log_action(uid, "login_error", f"{type(e).__name__}: {e.detalle}"[:300])
+                await editar_seguro(msg_login, f"❌ {nombre_base}: no se pudo iniciar sesión")
+                await say(e.usuario_msg)
+            else:
+                raise
             return
         await editar_seguro(msg_login, f"🔐 Sesión iniciada en {cfg['nombre']}")
         job.comprobar()
@@ -1410,7 +1593,31 @@ async def procesar_job(bot, job):
         await editar_seguro(msg_dl, f"✅ Descargado: {nombre_base} ({fmt_bytes(tamano)}) 100%")
         job.comprobar()
 
-        # 3. Subida (con reintentos y re-login si se corta la conexión)
+        # 3. ToDus: subir el archivo al servicio y enviarlo como adjunto al chat privado.
+        # No se modifica el flujo Moodle de las otras tres nubes.
+        if es_todus:
+            job.estado = "enviando a toDus"
+            prog_td = Progreso(tamano, job.cancelar)
+            titulo_td = f"📤 Enviando {nombre_base} a toDus → {TODUS_DESTINO}"
+            msg_td = await say(texto_progreso(titulo_td, prog_td), reply_markup=kb)
+            job.msg_actual = msg_td
+            try:
+                msg_id = await con_progreso(
+                    msg_td, titulo_td, prog_td,
+                    asyncio.to_thread(subir_y_enviar_todus, sesion, TODUS_DESTINO,
+                                      ruta, nombre_base, prog_td, job.cancelar), kb)
+                job.comprobar()
+                await editar_seguro(msg_td, f"✅ {nombre_base} enviado como archivo adjunto a toDus ({TODUS_DESTINO}).")
+                log_action(uid, "envio_todus", f"{nombre_base} ({tamano} bytes) -> {TODUS_DESTINO}; msg={msg_id}")
+            except JobCancelado:
+                raise
+            except Exception as e:
+                log_error(uid, f"Error enviando a toDus: {e}", traceback.format_exc())
+                await editar_seguro(msg_td, f"❌ Falló el envío de {nombre_base} a toDus.")
+                await say(f"toDus no pudo completar el envío: {str(e)[:500]}")
+            return
+
+        # 4. Subida Moodle (con reintentos y re-login si se corta la conexión)
         # Si el archivo se divide (y la nube usa 'draft'), todas las partes se suben al MISMO borrador
         # y dentro de una carpeta con el nombre del archivo.
         grupo = {"itemid": None, "carpeta": None}
@@ -1528,18 +1735,23 @@ async def procesar_job(bot, job):
                                             [f"<code>{h(e)}</code>" for e in enlaces])
                     if grupo["itemid"] and grupo["carpeta"]:   # un solo zip con todas las partes
                         url_zip = None
+                        nombre_zip = os.path.splitext(nombre_base)[0] + ".zip"
                         try:
                             url_zip = await asyncio.to_thread(zip_carpeta_moodle, sesion, base_url,
-                                                              grupo["itemid"], grupo["carpeta"])
+                                                              grupo["itemid"], grupo["carpeta"], nombre_zip)
                             if not url_zip:   # la sesión pudo caducar durante la subida: 1 reintento
                                 sesion = await asyncio.to_thread(login_moodle, usuario, contraseña, base_url)
                                 url_zip = await asyncio.to_thread(zip_carpeta_moodle, sesion, base_url,
-                                                                  grupo["itemid"], grupo["carpeta"])
+                                                                  grupo["itemid"], grupo["carpeta"], nombre_zip)
                         except Exception as e:
                             print(f"ZIP_CARPETA fallo: {type(e).__name__}: {e}")
+                            ZIP_DIAG["motivo"] = f"{type(e).__name__}: {e}"
                         if url_zip:
-                            await say(f"📦 <b>Todo en un solo zip</b> (ábrelo con ZArchiver):\n\n"
+                            await say(f"📦 <b>{h(nombre_zip)}</b> - todo en un solo zip (ábrelo con ZArchiver):\n\n"
                                       f"<code>{h(url_zip)}</code>", parse_mode='HTML')
+                        else:
+                            await say(f"⚠️ No pude armar el zip de la carpeta: {ZIP_DIAG['motivo'][:350]}\n"
+                                      f"Los enlaces de arriba siguen sirviendo.")
                 else:
                     await say(f"✅ <b>Subido exitosamente</b>\n\n<code>{h(enlaces[0])}</code>", parse_mode='HTML')
                 return
@@ -1597,12 +1809,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          (user_id, username, ahora(), ahora()))
             conn.execute("UPDATE usuarios SET ultimo_uso = ? WHERE telegram_id = ?", (ahora(), user_id))
         nube = obtener_nube_activa(user_id)
-        user, _ = obtener_credenciales_moodle(user_id, nube)
         nombre_nube = CLOUDS[nube]["nombre"]
-        estado = (f"☁️ Nube activa: {nombre_nube}\n"
-                  + ("✅ Cuenta conectada" if user else "❌ Usa /setmoodle usuario contraseña"))
+        if CLOUDS[nube].get("tipo") == "todus":
+            user, _ = obtener_credenciales_todus(user_id)
+            estado = (f"☁️ Nube activa: {nombre_nube}\n"
+                      + (f"✅ Cuenta emisora: {user}" if user else "❌ Usa /settodus número contraseña")
+                      + ("\n⚠️ Falta TODUS_DESTINO en Render" if not TODUS_DESTINO else ""))
+        else:
+            user, _ = obtener_credenciales_moodle(user_id, nube)
+            estado = (f"☁️ Nube activa: {nombre_nube}\n"
+                      + ("✅ Cuenta conectada" if user else "❌ Usa /setmoodle usuario contraseña"))
         await update.message.reply_text(
-            f"🤖 *Bot de Nube Moodle*\n\n"
+            f"🤖 *Bot de Nubes*\n\n"
             f"{estado}\n\n"
             f"📤 *Comandos:*\n"
             f"/files - Ver archivos\n"
@@ -1612,8 +1830,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/cola - Ver tus subidas en curso y en espera\n"
             f"/cancelar - Cancelar todo (o `/cancelar ID`)\n"
             f"/mystats - Estadísticas\n"
-            f"/setmoodle - Guardar cuenta de la nube activa\n"
-            f"/cambiar - Cambiar de nube\n\n"
+            f"/setmoodle - Guardar cuenta Moodle de la nube activa\n"
+            f"/settodus - Configurar cuenta emisora de toDus\n"
+            f"/cambiar - Cambiar de nube (incluye toDus)\n\n"
             f"💬 Envíame uno o varios *ENLACES*: se suben de uno en uno, en orden\n"
             f"🚫 Cada descarga y subida trae un botón *Cancelar*\n"
             f"_Máximo 10 GB por archivo_",
@@ -1704,7 +1923,10 @@ async def cmd_cambiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lineas = ["☁️ Elige la nube de subida:\n"]
     for k, cfg in CLOUDS.items():
         marca = " ✅ (activa)" if k == activa else ""
-        extra = "" if cfg["requiere_cuenta"] else " (sin credenciales)"
+        if cfg.get("tipo") == "todus":
+            extra = " (adjunto por mensaje privado)"
+        else:
+            extra = "" if cfg["requiere_cuenta"] else " (sin credenciales)"
         lineas.append(f"/{k} - {cfg['nombre']}{extra}{marca}")
     await update.message.reply_text("\n".join(lineas))
 
@@ -1721,13 +1943,20 @@ async def cmd_elegir_nube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         guardar_nube_activa(user_id, nube)
         cfg = CLOUDS[nube]
-        usuario, _ = obtener_credenciales_moodle(user_id, nube)
-        if cfg["requiere_cuenta"] and not usuario:
-            aviso = "\n❌ Aún no tienes cuenta guardada aquí. Usa /setmoodle usuario contraseña"
-        elif cfg["requiere_cuenta"]:
-            aviso = f"\n✅ Cuenta guardada: {usuario}"
+        if cfg.get("tipo") == "todus":
+            numero, _ = obtener_credenciales_todus(user_id)
+            aviso = (f"\n✅ Cuenta emisora: {numero}" if numero else
+                     "\n❌ Configura la cuenta emisora con /settodus número contraseña")
+            if not TODUS_DESTINO:
+                aviso += "\n⚠️ Falta TODUS_DESTINO en Render."
         else:
-            aviso = "\n✅ No necesita credenciales"
+            usuario, _ = obtener_credenciales_moodle(user_id, nube)
+            if cfg["requiere_cuenta"] and not usuario:
+                aviso = "\n❌ Aún no tienes cuenta guardada aquí. Usa /setmoodle usuario contraseña"
+            elif cfg["requiere_cuenta"]:
+                aviso = f"\n✅ Cuenta guardada: {usuario}"
+            else:
+                aviso = "\n✅ No necesita credenciales"
         await update.message.reply_text(f"☁️ Nube activa: {cfg['nombre']}{aviso}\n\nEnvíame un enlace para subirlo.")
         log_action(user_id, "cambiar_nube", cfg["nombre"])
     except Exception:
@@ -1756,6 +1985,34 @@ async def set_moodle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log_error(user_id, "Error en set_moodle", traceback.format_exc())
         await update.message.reply_text("❌ Error interno.")
+
+async def set_todus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guarda y prueba la cuenta emisora de toDus: /settodus número contraseña."""
+    if not update.message:
+        return
+    uid = update.effective_user.id
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Uso: /settodus número contraseña\n"
+            "Es el número de la cuenta que inicia sesión y envía los archivos. "
+            "El destinatario (teléfono o JID de grupo) se configura aparte en Render con TODUS_DESTINO.\n"
+            "Se requiere la contraseña real de la cuenta; no se usa el acceso inseguro solo por número. "
+            "Por seguridad, no reutilices aquí una contraseña de otros servicios.")
+        return
+    numero, contraseña = context.args[0].strip(), context.args[1]
+    numero_limpio = re.sub(r"[\s+()-]", "", numero)
+    if not numero_limpio.isdigit() or len(numero_limpio) != 10 or not numero_limpio.startswith("53"):
+        await update.message.reply_text("❌ El número emisor debe ser un teléfono cubano de 10 dígitos, comenzando por 53.")
+        return
+    msg = await update.message.reply_text("🔐 Probando inicio de sesión en toDus...")
+    try:
+        await asyncio.to_thread(crear_cliente_todus, numero_limpio, contraseña)
+        guardar_credenciales_todus(uid, numero_limpio, contraseña)
+        await editar_seguro(msg, f"✅ Cuenta toDus conectada: {numero_limpio}\nDestino: {TODUS_DESTINO or '⚠️ Falta configurar TODUS_DESTINO en Render'}")
+        log_action(uid, "set_todus", numero_limpio)
+    except Exception as e:
+        log_error(uid, "Error al configurar toDus", traceback.format_exc())
+        await editar_seguro(msg, f"❌ No pude iniciar sesión en toDus: {str(e)[:500]}")
 
 async def listar_archivos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -1968,10 +2225,19 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     nube = obtener_nube_activa(user_id)
     cfg = CLOUDS[nube]
-    usuario, _ = obtener_credenciales_moodle(user_id, nube)
-    if not usuario:
-        await update.message.reply_text(f"❌ Nube activa: {cfg['nombre']}. Primero usa /setmoodle usuario contraseña (o /cambiar para elegir otra nube)")
-        return
+    if cfg.get("tipo") == "todus":
+        usuario, contraseña = obtener_credenciales_todus(user_id)
+        if not usuario or not contraseña:
+            await update.message.reply_text("❌ Configura primero tu cuenta emisora de toDus con /settodus número contraseña.")
+            return
+        if not TODUS_DESTINO:
+            await update.message.reply_text("❌ Falta configurar TODUS_DESTINO en las variables de entorno de Render.")
+            return
+    else:
+        usuario, _ = obtener_credenciales_moodle(user_id, nube)
+        if not usuario:
+            await update.message.reply_text(f"❌ Nube activa: {cfg['nombre']}. Primero usa /setmoodle usuario contraseña (o /cambiar para elegir otra nube)")
+            return
 
     for n_url, url in enumerate(urls, 1):
         parsed = urlparse(url)
@@ -2135,6 +2401,7 @@ def main():
     app.add_error_handler(manejar_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setmoodle", set_moodle))
+    app.add_handler(CommandHandler("settodus", set_todus))
     app.add_handler(CommandHandler("cambiar", cmd_cambiar))
     app.add_handler(CommandHandler("cola", cmd_cola))
     app.add_handler(CommandHandler("cancelar", cmd_cancelar))
